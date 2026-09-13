@@ -1,0 +1,222 @@
+{
+  "schedules": [
+    {
+      "task_key": "poll-streams-every-5s",
+      "task_name": "app.l4_agents.tasks.beat_poll_streams",
+      "display_name": "Stream Poll",
+      "description": "Read from all 4 priority Redis streams and dispatch Celery tasks. Runs every 5 seconds.",
+      "schedule_type": "interval",
+      "interval_seconds": 5,
+      "cron_expression": null
+    },
+    {
+      "task_key": "reclaim-idle-every-60s",
+      "task_name": "app.l4_agents.tasks.beat_reclaim_idle_messages",
+      "display_name": "Idle Message Reclaim",
+      "description": "Reclaim Redis stream messages that were delivered to crashed workers. Runs every 60 seconds.",
+      "schedule_type": "interval",
+      "interval_seconds": 60,
+      "cron_expression": null
+    },
+    {
+      "task_key": "refresh-risk-profiles-hourly",
+      "task_name": "app.l4_agents.tasks.beat_refresh_risk_profiles",
+      "display_name": "Risk Profile Refresh",
+      "description": "Recompute stale customer risk profiles from orders and complaints data. Runs hourly.",
+      "schedule_type": "crontab",
+      "interval_seconds": null,
+      "cron_expression": "0 * * * *"
+    },
+    {
+      "task_key": "timeout-stuck-executions-every-10m",
+      "task_name": "app.l4_agents.tasks.beat_execution_plan_timeout",
+      "display_name": "Execution Timeout Check",
+      "description": "Mark cardinal_execution_plans stuck in 'processing' beyond the timeout threshold as 'failed'. Runs every 10 minutes.",
+      "schedule_type": "interval",
+      "interval_seconds": 600,
+      "cron_expression": null
+    },
+    {
+      "task_key": "purge-stale-dedup-keys-daily",
+      "task_name": "app.l4_agents.tasks.beat_purge_stale_dedup_keys",
+      "display_name": "Dedup Key Purge",
+      "description": "Delete deduplication_log rows older than 30 days to keep the table lean. Runs daily at 02:00 UTC.",
+      "schedule_type": "crontab",
+      "interval_seconds": null,
+      "cron_expression": "0 2 * * *"
+    }
+  ],
+  "rules": [
+    {
+      "name": "Auto-route confirmed fraud to Fraud Review",
+      "description": "Cardinal VERY_HIGH fraud segment \u2192 Fraud Review group with Critical priority",
+      "trigger_event": "TICKET_CREATED",
+      "condition_logic": "OR",
+      "conditions": [
+        {
+          "field": "ai_fraud_segment",
+          "operator": "eq",
+          "value": "VERY_HIGH"
+        }
+      ],
+      "actions": [
+        {
+          "action_type": "change_priority",
+          "params": {
+            "priority": 1
+          }
+        },
+        {
+          "action_type": "change_queue_type",
+          "params": {
+            "queue_type": "ESCALATION_QUEUE"
+          }
+        },
+        {
+          "action_type": "add_tag",
+          "params": {
+            "tag_name": "confirmed-fraud",
+            "tag_color": "#DC2626"
+          }
+        }
+      ],
+      "priority": 10
+    },
+    {
+      "name": "Flag suspicious high-refund cases",
+      "description": "Cardinal HIGH fraud + refund \u2265 \u20b9500 \u2192 Senior Review with High priority",
+      "trigger_event": "TICKET_CREATED",
+      "condition_logic": "AND",
+      "conditions": [
+        {
+          "field": "ai_fraud_segment",
+          "operator": "eq",
+          "value": "HIGH"
+        },
+        {
+          "field": "ai_refund_amount",
+          "operator": "gte",
+          "value": "500"
+        }
+      ],
+      "actions": [
+        {
+          "action_type": "change_priority",
+          "params": {
+            "priority": 2
+          }
+        },
+        {
+          "action_type": "change_queue_type",
+          "params": {
+            "queue_type": "SENIOR_REVIEW"
+          }
+        },
+        {
+          "action_type": "add_tag",
+          "params": {
+            "tag_name": "fraud-review",
+            "tag_color": "#F59E0B"
+          }
+        }
+      ],
+      "priority": 20
+    },
+    {
+      "name": "Escalate low-confidence Cardinal decisions",
+      "description": "AI confidence < 0.45 means Cardinal is uncertain \u2192 Senior Review",
+      "trigger_event": "TICKET_CREATED",
+      "condition_logic": "AND",
+      "conditions": [
+        {
+          "field": "ai_confidence",
+          "operator": "lt",
+          "value": "0.45"
+        }
+      ],
+      "actions": [
+        {
+          "action_type": "change_priority",
+          "params": {
+            "priority": 2
+          }
+        },
+        {
+          "action_type": "change_queue_type",
+          "params": {
+            "queue_type": "SENIOR_REVIEW"
+          }
+        },
+        {
+          "action_type": "add_tag",
+          "params": {
+            "tag_name": "low-confidence",
+            "tag_color": "#8B5CF6"
+          }
+        }
+      ],
+      "priority": 30
+    },
+    {
+      "name": "Auto-escalate SLA-breached tickets",
+      "description": "When SLA is breached and ticket is not already in Escalation queue \u2192 move up",
+      "trigger_event": "SLA_BREACHED",
+      "condition_logic": "AND",
+      "conditions": [
+        {
+          "field": "queue_type",
+          "operator": "ne",
+          "value": "ESCALATION_QUEUE"
+        },
+        {
+          "field": "status",
+          "operator": "ne",
+          "value": "RESOLVED"
+        },
+        {
+          "field": "status",
+          "operator": "ne",
+          "value": "CLOSED"
+        }
+      ],
+      "actions": [
+        {
+          "action_type": "change_queue_type",
+          "params": {
+            "queue_type": "SLA_BREACH_REVIEW"
+          }
+        },
+        {
+          "action_type": "change_priority",
+          "params": {
+            "priority": 2
+          }
+        }
+      ],
+      "priority": 40
+    },
+    {
+      "name": "Tag refund-related tickets",
+      "description": "Cardinal action code contains REFUND \u2192 add 'refund-case' tag for easy filtering",
+      "trigger_event": "TICKET_CREATED",
+      "condition_logic": "AND",
+      "conditions": [
+        {
+          "field": "ai_action_code",
+          "operator": "contains",
+          "value": "REFUND"
+        }
+      ],
+      "actions": [
+        {
+          "action_type": "add_tag",
+          "params": {
+            "tag_name": "refund-case",
+            "tag_color": "#059669"
+          }
+        }
+      ],
+      "priority": 50
+    }
+  ]
+}

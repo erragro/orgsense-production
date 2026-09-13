@@ -1,0 +1,136 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: governance
+  namespace: auralis
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: governance
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ingest
+  namespace: auralis
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: ingest
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ui
+  namespace: auralis
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: ui
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker-celery
+  namespace: auralis
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: worker-celery
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker-poll
+  namespace: auralis
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: worker-poll
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker-beat
+  namespace: auralis
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: worker-beat
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: weaviate
+  namespace: auralis
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: weaviate
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: governance
+  namespace: auralis
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: governance
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ingest
+  namespace: auralis
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ingest
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ui
+  namespace: auralis
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ui
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70

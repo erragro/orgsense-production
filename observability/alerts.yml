@@ -1,0 +1,50 @@
+groups:
+  - name: orgsense-availability
+    rules:
+      - alert: OrgSenseTargetDown
+        expr: up{job=~"kirana-kart-(governance|ingest|workers)"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "OrgSense service scrape has failed for two minutes"
+      - alert: OrgSenseEnrichmentFailures
+        expr: sum(rate(orgsense_operations_total{operation="enrichment",outcome="error"}[5m])) / clamp_min(sum(rate(orgsense_operations_total{operation="enrichment"}[5m])), 0.001) > 0.05
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "More than 5% of enrichment operations are failing"
+      - alert: OrgSenseLLMFailures
+        expr: sum(increase(orgsense_operations_total{operation="llm",outcome="error"}[5m])) > 3
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Repeated LLM pipeline failures"
+      - alert: OrgSensePublishFailure
+        expr: sum(increase(orgsense_operations_total{operation="publish",outcome="error"}[5m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "Policy publish failed; inspect service logs and database state"
+      - alert: OrgSenseQueueBacklog
+        expr: max by (priority) (orgsense_cardinal_queue_depth) > 1000
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Cardinal pending work exceeds 1000 messages"
+      - alert: OrgSenseGrievanceOverdue
+        expr: max(orgsense_overdue_grievances) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Unresolved data-rights request is past its response deadline"
+      - alert: OrgSenseGrievanceUnassigned
+        expr: max(orgsense_unassigned_grievances) > 0
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "A data-rights request needs an assigned owner"
+      - alert: OrgSenseMonitoringFailed
+        expr: min by (dependency) (orgsense_monitor_healthy) == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Operational monitoring cannot read a dependency"

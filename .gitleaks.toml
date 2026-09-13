@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Exact non-secret scheduler identifier and frozen DDL fingerprint"
+regexTarget = "line"
+regexes = [
+  '^\s*"task_key": "reclaim-idle-every-60s",\s*$',
+  '^\s*"app/admin/services/auth_service\.py:14de7ef3645490b90e7929b2728aad1ca924d09c1d06b21c11232bd940acb4e8": true,\s*$',
+]

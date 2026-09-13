@@ -1,0 +1,54 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: orgsense-migrate
+  namespace: auralis
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: migrate
+        image: asia-south1-docker.pkg.dev/project-2d37241a-3276-4c0d-b31/auralis/governance:RELEASE_REQUIRED
+        command:
+        - python
+        - scripts/migrate.py
+        envFrom:
+        - secretRef:
+            name: auralis-migration-env
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: runtime-tmp
+          mountPath: /tmp
+        env:
+        - name: PYTHONDONTWRITEBYTECODE
+          value: '1'
+        - name: HOME
+          value: /tmp
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 60
+      volumes:
+      - name: runtime-tmp
+        emptyDir:
+          sizeLimit: 256Mi

@@ -1,0 +1,54 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: application-boundaries
+  namespace: auralis
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - podSelector: {}
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+    ports:
+    - port: 8080
+    - port: 8000
+    - port: 8001
+  egress:
+  - to:
+    - podSelector: {}
+  - ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+    - port: 443
+    - port: 5432
+    - port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: public-api-ui
+  namespace: auralis
+spec:
+  podSelector:
+    matchExpressions:
+    - key: app
+      operator: In
+      values:
+      - ui
+      - governance
+      - ingest
+  policyTypes:
+  - Ingress
+  ingress:
+  - ports:
+    - port: 8080
+    - port: 8000
+    - port: 8001

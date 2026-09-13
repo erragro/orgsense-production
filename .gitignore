@@ -1,0 +1,53 @@
+# Environment files
+.env
+.env.*
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+myenv/
+
+# Node
+node_modules/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Database
+*.sqlite
+*.db
+
+# IDE
+.vscode/
+.idea/
+
+# build
+dist/
+build/
+
+# secrets
+secrets.json
+config_local.py
+
+# Claude Code — local session data (not needed in repo)
+.claude/
+
+# Database exports — may contain credentials or PII
+kirana_kart/exports/
+
+# Python virtualenvs (additional names)
+.venv/
+
+# Verification artifacts
+.coverage
+coverage.json
+*-results.xml
+**/test-results/
+**/playwright-report/

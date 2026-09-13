@@ -1,0 +1,98 @@
+name: Verification
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  backend:
+    name: Backend tests and coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: 'kirana_kart/requirements*.txt'
+      - run: pip install -r kirana_kart/requirements-dev.txt
+      - run: python -m pytest -q kirana_kart/tests -m 'not integration' --cov=kirana_kart/app --cov-report=json:coverage.json --junitxml=unit-results.xml
+      - name: Enforce coverage ratchet
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python scripts/check_coverage.py coverage.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-verification
+          path: |
+            coverage.json
+            unit-results.xml
+  database:
+    name: PostgreSQL migrations and controls
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_pass
+          POSTGRES_DB: orgsense_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U test_user -d orgsense_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MIGRATION_DATABASE_URL: postgresql+psycopg2://test_user:test_pass@localhost:5432/orgsense_test
+      TEST_DATABASE_URL: postgresql+psycopg2://test_user:test_pass@localhost:5432/orgsense_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: 'kirana_kart/requirements*.txt'
+      - run: pip install -r kirana_kart/requirements-dev.txt
+      - name: Reproduce schema and rehearse empty-database rollback
+        run: |
+          alembic -c kirana_kart/alembic.ini upgrade head
+          alembic -c kirana_kart/alembic.ini downgrade base
+          alembic -c kirana_kart/alembic.ini upgrade head
+      - run: python -m pytest -q kirana_kart/tests/integration --junitxml=database-results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: database-verification
+          path: database-results.xml
+  frontend:
+    name: Frontend typecheck and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: kirana_kart_ui/package-lock.json
+      - run: npm ci --prefix kirana_kart_ui
+      - run: npm run build --prefix kirana_kart_ui
+      - run: npx playwright install --with-deps chromium
+        working-directory: kirana_kart_ui
+      - run: npx playwright test --config=playwright.smoke.config.ts
+        working-directory: kirana_kart_ui
+      - name: Verify hardened nginx runtime
+        run: |
+          docker build -t orgsense-ui-check -f kirana_kart_ui/Dockerfile kirana_kart_ui
+          docker run -d --name orgsense-ui-check --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --cap-drop=ALL --security-opt=no-new-privileges -p 127.0.0.1:4174:8080 orgsense-ui-check
+          trap 'docker rm -f orgsense-ui-check' EXIT
+          cd kirana_kart_ui
+          SMOKE_BASE_URL=http://127.0.0.1:4174 npx playwright test --config=playwright.smoke.config.ts
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: frontend-traces
+          path: kirana_kart_ui/test-results
