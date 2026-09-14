@@ -112,19 +112,18 @@ def disable_shadow(user: UserContext = Depends(_admin)):
 @router.get("/stats")
 def get_shadow_stats(_u: UserContext = Depends(_view)):
     with get_db_session() as session:
-        result = session.execute(text("""
-            SELECT
-                COUNT(*) AS total,
-                SUM(CASE WHEN decision_changed THEN 1 ELSE 0 END) AS changed
-            FROM kirana_kart.policy_shadow_results
-        """)).mappings().first()
-
         runtime = session.execute(text("""
-            SELECT active_version, shadow_version
-            FROM kirana_kart.kb_runtime_config
-            ORDER BY id DESC
-            LIMIT 1
+            SELECT active_version, shadow_version, kb_id
+            FROM kirana_kart.kb_runtime_config ORDER BY id DESC LIMIT 1
         """)).mappings().first()
+        result = session.execute(text("""
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN decision_changed THEN 1 ELSE 0 END) AS changed,
+                   MAX(created_at) AS last_evaluated_at
+            FROM kirana_kart.policy_shadow_results
+            WHERE active_policy_version = :active AND candidate_policy_version = :candidate
+        """), {"active": runtime["active_version"] if runtime else None,
+                 "candidate": runtime["shadow_version"] if runtime else None}).mappings().first()
 
     total = result["total"] or 0
     changed = result["changed"] or 0
@@ -136,6 +135,8 @@ def get_shadow_stats(_u: UserContext = Depends(_view)):
         "shadow_version": shadow_version,
         "active_version": runtime["active_version"] if runtime else None,
         "total_evaluated": total,
+        "kb_id": runtime["kb_id"] if runtime else None,
+        "last_evaluated_at": result["last_evaluated_at"],
         "decisions_changed": changed,
         "change_rate": change_rate,
         "is_active": bool(shadow_version),

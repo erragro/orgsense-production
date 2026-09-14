@@ -52,6 +52,7 @@ router = APIRouter(prefix="/bpm", tags=["BPM"])
 _kb_view  = require_permission("knowledgeBase", "view")
 _kb_edit  = require_permission("knowledgeBase", "edit")
 _kb_admin = require_permission("knowledgeBase", "admin")
+_policy_admin = require_permission("policy", "admin")
 _sys_admin = require_permission("system", "admin")
 
 _bpm_service = BPMService(engine)
@@ -226,6 +227,7 @@ def list_instances(
     kb_id: str,
     stage: Optional[str] = Query(None, description="Filter by stage"),
     limit: int = Query(50, ge=1, le=200),
+    entity_id: Optional[str] = Query(None, description="Exact proposal version"),
     u: UserContext = Depends(_kb_view),
 ):
     """List BPM instances for a KB, optionally filtered by stage."""
@@ -235,6 +237,7 @@ def list_instances(
             kb_id=kb_id,
             stage_filter=stage,
             limit=limit,
+            entity_id=entity_id,
         )
         return jsonable_encoder(instances)
     except Exception:
@@ -421,6 +424,9 @@ def reject_request(
 async def upload_document_file(
     kb_id: str,
     file: UploadFile = File(...),
+    change_name: str = Form(default="", max_length=160),
+    business_outcome: str = Form(default="", max_length=2000),
+    affected_scope: str = Form(default="", max_length=1000),
     u: UserContext = Depends(_kb_edit),
 ):
     """
@@ -492,6 +498,11 @@ async def upload_document_file(
             entity_type="kb_version",
             created_by_id=u.id,
             created_by_name=u.email,
+            metadata={"business_brief": {
+                "name": change_name.strip() or filename,
+                "outcome": business_outcome.strip(),
+                "scope": affected_scope.strip(),
+            }},
         )
 
         return {
@@ -534,6 +545,7 @@ def simulate_version(
         PolicySimulationService,
     )
 
+    _require_kb_access(u, kb_id, "admin")
     entity_id = body.get("entity_id", "")
     if not entity_id:
         raise HTTPException(status_code=400, detail="entity_id required")
@@ -600,6 +612,9 @@ def simulate_version(
         "baseline_version": baseline_version,
         "candidate_version": entity_id,
         "threshold": SIMULATION_GATE_THRESHOLD,
+        "sample_source": "Saved simulation cases (up to 1,000; not a dated or representative sample)",
+        "examples": result.get("examples", []),
+        "measurement_scope": "Final action differences only; financial impact and customer outcomes are not measured",
     }
 
     with engine.connect() as conn:
@@ -629,7 +644,7 @@ def simulate_version(
 def publish_version_bpm(
     kb_id: str,
     body: dict,
-    u: UserContext = Depends(_kb_admin),
+    u: UserContext = Depends(_policy_admin),
 ):
     """
     Publish a policy version that is in PENDING_APPROVAL or ACTIVE stage.
@@ -650,6 +665,7 @@ def publish_version_bpm(
     from app.l1_ingestion.kb_registry.kb_registry_service import KBRegistryService
     from app.l45_ml_platform.compiler.sop_extractor import commit_proposals_to_registry
 
+    _require_kb_access(u, kb_id, "admin")
     entity_id = body.get("entity_id", "")
     if not entity_id:
         raise HTTPException(status_code=400, detail="entity_id required")
@@ -665,8 +681,7 @@ def publish_version_bpm(
         raise HTTPException(status_code=404, detail="BPM instance not found")
 
     stage = row["current_stage"]
-    if stage not in ("PENDING_APPROVAL", "SHADOW_GATE", "SIMULATION_GATE",
-                     "RULE_EDIT", "ACTIVE"):
+    if stage not in ("PENDING_APPROVAL", "ACTIVE"):
         raise HTTPException(
             status_code=400,
             detail=f"Cannot publish from stage '{stage}'",
@@ -746,6 +761,7 @@ def compile_document(
     """
     from sqlalchemy import text
 
+    _require_kb_access(u, kb_id, "admin")
     entity_id = body.get("entity_id", "")
     if not entity_id:
         raise HTTPException(status_code=400, detail="entity_id required")
@@ -848,6 +864,7 @@ def extract_taxonomy_stage(
     from sqlalchemy import text
     from app.l45_ml_platform.compiler.sop_extractor import extract_taxonomy
 
+    _require_kb_access(u, kb_id, "admin")
     entity_id = body.get("entity_id", "")
     if not entity_id:
         raise HTTPException(status_code=400, detail="entity_id required")
@@ -969,6 +986,7 @@ def extract_actions_stage(
     from sqlalchemy import text
     from app.l45_ml_platform.compiler.sop_extractor import extract_actions
 
+    _require_kb_access(u, kb_id, "admin")
     entity_id = body.get("entity_id", "")
     if not entity_id:
         raise HTTPException(status_code=400, detail="entity_id required")
@@ -1088,6 +1106,7 @@ def generate_rules_stage(
     """
     from app.l45_ml_platform.compiler.sop_extractor import generate_rules
 
+    _require_kb_access(u, kb_id, "admin")
     entity_id = body.get("entity_id", "")
     if not entity_id:
         raise HTTPException(status_code=400, detail="entity_id required")

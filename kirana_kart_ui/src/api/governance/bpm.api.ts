@@ -180,7 +180,7 @@ export const bpmApi = {
 
   // --- Instances ---
 
-  listInstances: (kbId: string, params?: { stage?: string; limit?: number }) =>
+  listInstances: (kbId: string, params?: { stage?: string; limit?: number; entity_id?: string }) =>
     apiClient.get<BPMInstance[]>(`/bpm/${kbId}/instances`, { params }),
 
   createInstance: (

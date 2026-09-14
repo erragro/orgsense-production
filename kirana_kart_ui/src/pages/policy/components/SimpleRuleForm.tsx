@@ -51,6 +51,7 @@ export function SimpleRuleForm({ kbId, policyVersion, rule, actionCodes, onClose
   const [evidenceRequired, setEvidenceRequired] = useState(rule?.evidence_required ?? false)
   const [deterministic, setDeterministic] = useState(rule?.deterministic ?? true)
   const [overrideable, setOverrideable] = useState(rule?.overrideable ?? false)
+  const unsupportedConditions = rule?.conditions != null && !isCondition(rule.conditions)
   const [conditions, setConditions] = useState<Condition>(
     () => (isCondition(rule?.conditions)
       ? rule!.conditions
@@ -74,6 +75,7 @@ export function SimpleRuleForm({ kbId, policyVersion, rule, actionCodes, onClose
 
   const mutation = useMutation({
     mutationFn: () => {
+      if (unsupportedConditions) throw new Error("This rule needs a condition-format review before editing.")
       const payload: RuleCreate = {
         policy_version: policyVersion,
         issue_type_l1: issueL1,
@@ -104,6 +106,7 @@ export function SimpleRuleForm({ kbId, policyVersion, rule, actionCodes, onClose
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
+    if (unsupportedConditions) { setError('This rule needs a condition-format review before editing.'); return }
     if (!issueL1) { setError('Please select an issue type.'); return }
     if (!actionId) { setError('Please select an action.'); return }
     mutation.mutate()
@@ -120,7 +123,7 @@ export function SimpleRuleForm({ kbId, policyVersion, rule, actionCodes, onClose
   return (
     <>
       <div className="fixed inset-0 z-50 bg-black/50" onClick={onClose} />
-      <div className="fixed inset-0 z-60 flex items-center justify-center p-4">
+      <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
         <div className="bg-surface-card border border-surface-border rounded-2xl shadow-2xl w-full max-w-xl max-h-[90vh] overflow-y-auto">
           {/* Header */}
           <div className="flex items-center justify-between px-6 py-4 border-b border-surface-border sticky top-0 bg-surface-card z-10">
@@ -241,7 +244,10 @@ export function SimpleRuleForm({ kbId, policyVersion, rule, actionCodes, onClose
               <label className="block text-sm font-medium text-foreground mb-1.5">
                 When does this rule apply? (optional conditions)
               </label>
-              <ConditionBuilder value={conditions} onChange={setConditions} />
+              {unsupportedConditions ? <div role="alert" className="rounded-lg border border-amber-300 p-3 text-sm space-y-2">
+                <p>This rule uses a condition format this editor cannot safely interpret. Saving is disabled to protect the existing conditions. Ask a policy administrator to review and migrate this rule.</p>
+                <details><summary className="cursor-pointer">View original conditions</summary><pre className="whitespace-pre-wrap break-all text-xs mt-2">{JSON.stringify(rule?.conditions, null, 2)}</pre></details>
+              </div> : <ConditionBuilder value={conditions} onChange={setConditions} />}
             </div>
 
             {/* Order value range */}
@@ -343,7 +349,7 @@ export function SimpleRuleForm({ kbId, policyVersion, rule, actionCodes, onClose
             </div>
 
             {/* Plain-English summary */}
-            {issueL1 && selectedAction && (
+            {!unsupportedConditions && issueL1 && selectedAction && (
               <div className="bg-blue-50 dark:bg-blue-900/10 border border-blue-200 dark:border-blue-700 rounded-lg p-3">
                 <p className="text-xs text-blue-700 dark:text-blue-300 font-medium mb-1">This rule means:</p>
                 <p className="text-sm text-blue-800 dark:text-blue-200 italic">
@@ -373,7 +379,7 @@ export function SimpleRuleForm({ kbId, policyVersion, rule, actionCodes, onClose
               </button>
               <button
                 type="submit"
-                disabled={mutation.isPending}
+                disabled={mutation.isPending || unsupportedConditions}
                 className="flex-1 py-2.5 text-sm bg-brand-600 text-white rounded-lg font-medium hover:bg-brand-700 disabled:opacity-50 transition-colors flex items-center justify-center gap-2"
               >
                 {mutation.isPending && <Loader2 className="w-4 h-4 animate-spin" />}

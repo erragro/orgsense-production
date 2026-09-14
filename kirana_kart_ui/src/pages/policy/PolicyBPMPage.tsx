@@ -19,6 +19,7 @@ import { bpmApi, type BPMInstance } from '@/api/governance/bpm.api'
 import { VersionCard } from './components/VersionCard'
 import { BPMStageDrawer } from './components/BPMStageDrawer'
 import { VersionWizard } from './components/VersionWizard'
+import { PolicyValueIntro } from './components/PolicyValueIntro'
 import { MLHealthPanel } from './components/MLHealthPanel'
 
 // Map BPM stage names to plain-English status labels for display
@@ -28,9 +29,9 @@ export const STAGE_LABEL: Record<string, string> = {
   AI_COMPILE_FAILED:      'Analysis failed',
   RULE_EDIT:              'Reviewing rules',
   SIMULATION_GATE:        'Running impact preview',
-  SIMULATION_FAILED:      'Impact preview failed',
-  SHADOW_GATE:            'Background test running',
-  SHADOW_DIVERGENCE_HIGH: 'Background test: large changes found',
+  SIMULATION_FAILED:      'Impact comparison needs review',
+  SHADOW_GATE:            'Live comparison stage — verify evidence',
+  SHADOW_DIVERGENCE_HIGH: 'Live comparison differences need review',
   PENDING_APPROVAL:       'Waiting for approval',
   REJECTED:               'Rejected',
   ACTIVE:                 'Active',
@@ -64,9 +65,9 @@ export default function PolicyBPMPage() {
     refetchInterval: 30_000, // refresh every 30s for in-progress gates
   })
 
-  const inProgress = instances.filter((i) => !['ACTIVE', 'RETIRED'].includes(i.current_stage))
+  const inProgress = instances.filter((i) => !['ACTIVE', 'RETIRED', 'REJECTED', 'SIMULATION_FAILED', 'AI_COMPILE_FAILED', 'SHADOW_DIVERGENCE_HIGH'].includes(i.current_stage))
   const published  = instances.filter((i) => i.current_stage === 'ACTIVE')
-  const retired    = instances.filter((i) => ['RETIRED', 'REJECTED', 'SIMULATION_FAILED'].includes(i.current_stage))
+  const retired    = instances.filter((i) => ['RETIRED', 'REJECTED', 'SIMULATION_FAILED', 'AI_COMPILE_FAILED', 'SHADOW_DIVERGENCE_HIGH'].includes(i.current_stage))
 
   return (
     <div className="max-w-4xl mx-auto py-8 px-4">
@@ -77,9 +78,9 @@ export default function PolicyBPMPage() {
             <GitBranch className="w-5 h-5 text-brand-600" />
           </div>
           <div>
-            <h1 className="text-xl font-semibold text-foreground">Policy Versions</h1>
+            <h1 className="text-xl font-semibold text-foreground">Policy Studio</h1>
             <p className="text-sm text-muted">
-              {activeKB ? activeKB.kb_name : activeKbId} — manage and publish policy versions
+              {activeKB ? activeKB.kb_name : activeKbId} — design, test and govern business decisions
             </p>
           </div>
         </div>
@@ -98,11 +99,13 @@ export default function PolicyBPMPage() {
               className="flex items-center gap-2 px-4 py-2 bg-brand-600 text-white rounded-lg text-sm font-medium hover:bg-brand-700 transition-colors"
             >
               <Plus className="w-4 h-4" />
-              New Version
+              Create policy change
             </button>
           )}
         </div>
       </div>
+
+      <PolicyValueIntro />
 
       {isLoading && (
         <div className="flex justify-center py-16">
@@ -155,7 +158,7 @@ export default function PolicyBPMPage() {
       {retired.length > 0 && (
         <Section
           emoji="❌"
-          title="Rejected / Retired"
+          title="Needs attention / Retired"
           count={retired.length}
           collapsible
           className="mb-6"
@@ -188,9 +191,10 @@ export default function PolicyBPMPage() {
 
       {/* ML Health Panel — admin only */}
       {canAdmin && (
-        <div className="bg-surface-card border border-surface-border rounded-xl p-5 mb-6">
+        <details className="bg-surface-card border border-surface-border rounded-xl p-5 mb-6">
+          <summary className="cursor-pointer text-sm font-medium mb-3">Advanced: model diagnostics</summary>
           <MLHealthPanel kbId={activeKbId} canAdmin={canAdmin} />
-        </div>
+        </details>
       )}
 
       {/* New version wizard */}

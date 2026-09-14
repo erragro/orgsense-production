@@ -73,6 +73,8 @@ export interface SimulationRunPayload {
 }
 
 export interface ShadowStats {
+  kb_id?: string | null
+  last_evaluated_at?: string | null
   shadow_version: string | null
   active_version: string | null
   total_evaluated: number

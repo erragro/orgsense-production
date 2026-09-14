@@ -39,7 +39,7 @@ class ShadowRepository:
                     active_version,
                     shadow_version
                 FROM kirana_kart.kb_runtime_config
-                LIMIT 1
+                ORDER BY id DESC LIMIT 1
             """)).mappings().first()
 
         if not row:

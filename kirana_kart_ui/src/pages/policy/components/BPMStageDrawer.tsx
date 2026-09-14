@@ -350,8 +350,8 @@ function GatesTab({ gates }: { gates: GateResult[] }) {
   }
 
   const GATE_LABEL: Record<string, string> = {
-    simulation: 'Impact Preview',
-    shadow:     'Background Test',
+    simulation: 'Sample decision comparison',
+    shadow:     'Live comparison evidence',
     diff_review: 'Change Review',
   }
 
@@ -375,13 +375,13 @@ function GatesTab({ gates }: { gates: GateResult[] }) {
               'text-xs px-2 py-0.5 rounded-full font-medium',
               g.passed ? 'text-green-600 bg-green-100 dark:bg-green-900/30' : 'text-red-600 bg-red-100 dark:bg-red-900/30',
             )}>
-              {g.passed ? 'Passed' : 'Failed'}
+              {g.passed ? 'Within configured threshold' : 'Threshold exceeded: review required'}
             </span>
           </div>
 
           {/* Metrics */}
           <div className="space-y-1">
-            {Object.entries(g.metrics as Record<string, unknown>).map(([key, val]) => (
+            {Object.entries(g.metrics as Record<string, unknown>).filter(([, val]) => val == null || ['string', 'number', 'boolean'].includes(typeof val)).map(([key, val]) => (
               <div key={key} className="flex justify-between text-xs">
                 <span className="text-muted capitalize">{key.replace(/_/g, ' ')}</span>
                 <span className="text-foreground font-medium font-mono">
@@ -390,6 +390,12 @@ function GatesTab({ gates }: { gates: GateResult[] }) {
                     : String(val)}
                 </span>
               </div>
+            ))}
+            {Object.entries(g.metrics as Record<string, unknown>).filter(([, val]) => val !== null && typeof val === 'object').map(([key, val]) => (
+              <details key={key} className="text-xs border-t border-surface-border pt-2 mt-2">
+                <summary className="cursor-pointer capitalize">View {key.replace(/_/g, ' ')}{Array.isArray(val) ? ` (${val.length} items)` : ' (structured evidence)'}</summary>
+                <pre className="whitespace-pre-wrap break-all mt-2 max-h-64 overflow-auto">{JSON.stringify(val, null, 2)}</pre>
+              </details>
             ))}
           </div>
 

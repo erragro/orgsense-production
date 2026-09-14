@@ -416,6 +416,7 @@ class BPMService:
         kb_id: str,
         stage_filter: Optional[str] = None,
         limit: int = 50,
+        entity_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         with self.engine.connect() as conn:
             query = """
@@ -430,7 +431,10 @@ class BPMService:
             if stage_filter:
                 query += " AND i.current_stage = :stage"
                 params["stage"] = stage_filter
-            query += " ORDER BY i.started_at DESC LIMIT :limit"
+            if entity_id is not None:
+                query += " AND i.entity_id = :entity_id"
+                params["entity_id"] = entity_id
+            query += " ORDER BY i.started_at DESC, i.id DESC LIMIT :limit"
 
             rows = conn.execute(text(query), params).mappings().all()
             return [dict(r) for r in rows]

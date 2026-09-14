@@ -38,10 +38,10 @@ const NAV_GROUPS: NavGroup[] = [
   {
     label: 'Governance',
     items: [
-      { label: 'Taxonomy', icon: TreeDeciduous, path: '/taxonomy', module: 'taxonomy' },
+      { label: 'Customer Problems', icon: TreeDeciduous, path: '/taxonomy', module: 'taxonomy' },
       { label: 'Knowledge Base', icon: BookOpen, path: '/knowledge-base', module: 'knowledgeBase' },
-      { label: 'Policy', icon: Shield, path: '/policy', module: 'policy' },
-      { label: 'Policy BPM', icon: GitBranch, path: '/policy/bpm', module: 'policy' },
+      { label: 'Policy Testing', icon: Shield, path: '/policy', module: 'policy' },
+      { label: 'Policy Studio', icon: GitBranch, path: '/policy/bpm', module: 'policy' },
     ],
   },
   {
@@ -131,6 +131,7 @@ export function Sidebar() {
               <NavLink
                 key={item.path}
                 to={item.path}
+                end={item.path === '/policy'}
                 className={({ isActive }) =>
                   cn(
                     'flex items-center gap-2.5 px-2 py-2 rounded-md text-sm transition-colors mb-0.5',

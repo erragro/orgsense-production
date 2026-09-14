@@ -10,9 +10,10 @@ import { KBContextSelector } from './KBContextSelector'
 const BREADCRUMB_MAP: Record<string, string> = {
   '/dashboard': 'Dashboard',
   '/tickets': 'Tickets',
-  '/taxonomy': 'Taxonomy',
+  '/taxonomy': 'Customer Problems',
   '/knowledge-base': 'Knowledge Base',
-  '/policy': 'Policy',
+  '/policy': 'Policy Testing',
+  '/policy/bpm': 'Policy Studio',
   '/customers': 'Customers',
   '/analytics': 'Analytics',
   '/system': 'System Admin',
@@ -38,7 +39,7 @@ export function TopBar({ systemHealthStatus }: TopBarProps) {
   // Derive breadcrumb
   const segments = pathname.split('/').filter(Boolean)
   const topRoute = '/' + (segments[0] ?? '')
-  const breadcrumb = BREADCRUMB_MAP[topRoute] ?? segments.map((s) => s.replace(/-/g, ' ')).join(' / ')
+  const breadcrumb = BREADCRUMB_MAP[pathname] ?? BREADCRUMB_MAP[topRoute] ?? segments.map((s) => s.replace(/-/g, ' ')).join(' / ')
 
   return (
     <header className="h-14 border-b border-surface-border bg-surface/80 backdrop-blur flex items-center justify-between px-4 sticky top-0 z-20">
@@ -46,7 +47,7 @@ export function TopBar({ systemHealthStatus }: TopBarProps) {
         <span className="text-subtle">Auralis</span>
         <span className="text-subtle opacity-60">/</span>
         <span className="text-foreground font-medium capitalize">{breadcrumb}</span>
-        {segments[1] && (
+        {segments[1] && !BREADCRUMB_MAP[pathname] && (
           <>
             <span className="text-subtle opacity-60">/</span>
             <span className="text-muted font-mono text-xs">{segments[1]}</span>

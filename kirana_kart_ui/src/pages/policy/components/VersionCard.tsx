@@ -50,9 +50,9 @@ const STEP_MAP: Record<string, string> = {
   AI_COMPILE_FAILED:      'Step 2 of 5 — Analysis failed',
   RULE_EDIT:              'Step 3 of 5 — Reviewing rules',
   SIMULATION_GATE:        'Step 4 of 5 — Running impact preview',
-  SIMULATION_FAILED:      'Step 4 of 5 — Impact preview failed',
-  SHADOW_GATE:            'Step 4 of 5 — Background test running',
-  SHADOW_DIVERGENCE_HIGH: 'Step 4 of 5 — Background test issues',
+  SIMULATION_FAILED:      'Step 4 of 5 — Review impact differences',
+  SHADOW_GATE:            'Step 4 of 5 — Live comparison — verify evidence',
+  SHADOW_DIVERGENCE_HIGH: 'Step 4 of 5 — Live comparison: review changes',
   PENDING_APPROVAL:       'Step 5 of 5 — Waiting for approval',
   REJECTED:               'Rejected — needs revision',
   ACTIVE:                 'Published and live',
@@ -97,13 +97,14 @@ export function VersionCard({ instance, onOpen }: Props) {
       {/* Main content */}
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span className="text-sm font-semibold text-foreground font-mono">
-            {instance.entity_id}
+          <span className="text-sm font-semibold text-foreground">
+            {typeof (instance.metadata?.business_brief as { name?: unknown } | undefined)?.name === 'string' ? (instance.metadata.business_brief as { name: string }).name : instance.entity_id}
           </span>
           <span className={cn('text-xs px-2 py-0.5 rounded-full font-medium', colorCls)}>
             {STAGE_LABEL[stage] ?? stage}
           </span>
         </div>
+        <p className="text-xs text-muted mt-0.5">Version: {instance.entity_id}</p>
         <p className="text-xs text-muted mt-0.5">{STEP_MAP[stage] ?? stage}</p>
         <div className="flex items-center gap-3 mt-1 text-xs text-subtle">
           {instance.created_by_name && (

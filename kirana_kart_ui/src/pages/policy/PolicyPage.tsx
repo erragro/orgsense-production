@@ -1,3 +1,4 @@
+import { useSearchParams } from 'react-router-dom'
 import { useState } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { PageHeader } from '@/components/layout/PageHeader'
@@ -23,7 +24,10 @@ import { Shield, Play, Ghost, BookOpen, Search, CheckCircle2, Zap, ArrowRight, A
 type Tab = 'versions' | 'simulation' | 'shadow'
 
 export default function PolicyPage() {
-  const [activeTab, setActiveTab] = useState<Tab>('versions')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const selectedView = searchParams.get('view')
+  const activeTab: Tab = selectedView === 'shadow' || selectedView === 'simulation' ? selectedView : 'versions'
+  const setActiveTab = (view: Tab) => setSearchParams({ view })
   const { user } = useAuthStore()
   const canPublish = !!(user?.is_super_admin || hasPermission(user, 'policy', 'admin'))
 
@@ -39,15 +43,15 @@ export default function PolicyPage() {
 
   const TABS = [
     { key: 'versions' as const, label: 'Versions', icon: BookOpen },
-    { key: 'simulation' as const, label: 'Simulation', icon: Play },
-    { key: 'shadow' as const, label: 'Shadow Policy', icon: Ghost },
+    { key: 'simulation' as const, label: 'Explore a case', icon: Play },
+    { key: 'shadow' as const, label: 'Live comparison', icon: Ghost },
   ]
 
   return (
     <div>
       <PageHeader
-        title="Policy Management"
-        subtitle="Compare policy versions, run simulations, and manage shadow testing"
+        title="Policy Testing"
+        subtitle="Understand how a proposed policy changes decisions before it governs new customer cases"
         actions={activeVersion && <VersionBadge version={activeVersion.active_version} isActive />}
       />
 
@@ -68,7 +72,7 @@ export default function PolicyPage() {
         <SimulationPanel versions={versions?.map((v) => v.version_label) ?? []} canEdit={!!(user?.is_super_admin || hasPermission(user, 'policy', 'edit'))} />
       )}
       {activeTab === 'shadow' && (
-        <ShadowPolicyPanel canPublish={canPublish} />
+        <ShadowPolicyPanel canPublish={canPublish} versions={versions?.map(v => v.version_label) ?? []} />
       )}
     </div>
   )
@@ -279,7 +283,7 @@ function SimulationPanel({ versions, canEdit }: { versions: string[]; canEdit: b
         candidate_version: candidate,
       })
       setResult(res.data as CardinalSimResult)
-      toast.success('Cardinal simulation complete')
+      toast.success('Case comparison complete')
     } catch (e: unknown) {
       const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail
       toast.error(msg || 'Simulation failed')
@@ -303,7 +307,7 @@ function SimulationPanel({ versions, canEdit }: { versions: string[]; canEdit: b
     <div className="space-y-4">
       {/* ── Step 1: Ticket picker ─────────────────────────── */}
       <Card>
-        <CardHeader><CardTitle className="text-sm flex items-center gap-2"><Search className="w-4 h-4" />Step 1 — Select Ticket</CardTitle></CardHeader>
+        <CardHeader><CardTitle className="text-sm flex items-center gap-2"><Search className="w-4 h-4" />Choose a customer case</CardTitle></CardHeader>
         <CardContent className="space-y-3">
           <div className="flex gap-2">
             <Input
@@ -355,7 +359,7 @@ function SimulationPanel({ versions, canEdit }: { versions: string[]; canEdit: b
       <Card>
         <CardHeader>
           <CardTitle className="text-sm flex items-center gap-2">
-            <Play className="w-4 h-4" />Step 2 — Select Versions & Run Cardinal Pipeline
+            <Play className="w-4 h-4" />Choose the policies to compare & Run Cardinal Pipeline
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -625,7 +629,7 @@ function SimulationPanel({ versions, canEdit }: { versions: string[]; canEdit: b
   )
 }
 
-function ShadowPolicyPanel({ canPublish }: { canPublish: boolean }) {
+function ShadowPolicyPanel({ canPublish, versions }: { canPublish: boolean; versions: string[] }) {
   const [shadowVersion, setShadowVersion] = useState('')
   const [showDisableConfirm, setShowDisableConfirm] = useState(false)
 
@@ -638,13 +642,13 @@ function ShadowPolicyPanel({ canPublish }: { canPublish: boolean }) {
 
   const enableMut = useMutation({
     mutationFn: (v: string) => shadowApi.enable({ shadow_version: v }),
-    onSuccess: () => { toast.success('Shadow policy enabled'); void refetch() },
+    onSuccess: () => { toast.success('Comparison configured; verify incoming evidence'); void refetch() },
     onError: () => toast.error('Failed to enable shadow'),
   })
 
   const disableMut = useMutation({
     mutationFn: () => shadowApi.disable(),
-    onSuccess: () => { toast.success('Shadow policy disabled'); setShowDisableConfirm(false); void refetch() },
+    onSuccess: () => { toast.success('Comparison stopped'); setShowDisableConfirm(false); void refetch() },
     onError: () => toast.error('Failed to disable shadow'),
   })
 
@@ -659,17 +663,17 @@ function ShadowPolicyPanel({ canPublish }: { canPublish: boolean }) {
             <div>
               <div className="flex items-center gap-2 mb-1">
                 <Ghost className="w-5 h-5 text-amber-400" />
-                <span className="font-semibold text-foreground">Shadow Policy</span>
-                <Badge variant={isActive ? 'amber' : 'gray'}>{isActive ? 'Active' : 'Inactive'}</Badge>
+                <span className="font-semibold text-foreground">Live comparison</span>
+                <Badge variant={isActive ? 'amber' : 'gray'}>{isActive ? 'Configured' : 'Not configured'}</Badge>
               </div>
               {isActive && stats && (
                 <div className="flex gap-6 mt-2 text-sm">
                   <div>
-                    <span className="text-muted">Shadow: </span>
+                    <span className="text-muted">Proposed: </span>
                     {stats.shadow_version && <VersionBadge version={stats.shadow_version} isShadow />}
                   </div>
                   <div>
-                    <span className="text-muted">vs Active: </span>
+                    <span className="text-muted">Current: </span>
                     {stats.active_version && <VersionBadge version={stats.active_version} isActive />}
                   </div>
                 </div>
@@ -677,12 +681,21 @@ function ShadowPolicyPanel({ canPublish }: { canPublish: boolean }) {
             </div>
             {canPublish && isActive && (
               <Button variant="danger" size="sm" onClick={() => setShowDisableConfirm(true)} loading={disableMut.isPending}>
-                Disable Shadow
+                Stop comparison
               </Button>
             )}
           </div>
         </CardContent>
       </Card>
+
+      <Card><CardContent className="py-4 text-sm space-y-2">
+        <p className="font-semibold">Observe a proposal alongside the current policy</p>
+        {stats?.kb_id && <p>Current runtime workspace: {stats.kb_id}</p>}
+        <p className="text-muted">The current policy remains responsible for customer decisions. A configured comparison is not proof that evaluation is running: verify recorded cases and their timestamps before relying on it.</p>
+        <p className="text-muted">Evidence below covers this current/proposed version pair across its recorded history, not a new experiment or a representative sample. No savings or quality improvement is inferred from the change rate.</p>
+        {isActive && stats?.total_evaluated === 0 && <p role="status" className="text-amber-700 dark:text-amber-300">No comparison evidence received for this version pair. Do not treat this as a passed test.</p>}
+        {stats?.last_evaluated_at && <p>Latest recorded case: {new Date(stats.last_evaluated_at).toLocaleString()}</p>}
+      </CardContent></Card>
 
       {/* Stats */}
       {isActive && stats && (
@@ -690,7 +703,7 @@ function ShadowPolicyPanel({ canPublish }: { canPublish: boolean }) {
           {[
             { label: 'Tickets Evaluated', value: stats.total_evaluated.toLocaleString() },
             { label: 'Decisions Changed', value: stats.decisions_changed.toLocaleString(), highlight: stats.decisions_changed > 0 },
-            { label: 'Change Rate', value: `${(stats.change_rate * 100).toFixed(1)}%`, highlight: stats.change_rate > 0.05 },
+            { label: 'Different decisions', value: `${(stats.change_rate * 100).toFixed(1)}%`, highlight: false },
           ].map((s) => (
             <Card key={s.label}>
               <CardContent className="py-3 text-center">
@@ -705,12 +718,17 @@ function ShadowPolicyPanel({ canPublish }: { canPublish: boolean }) {
       {/* Enable Form */}
       {!isActive && canPublish && (
         <Card>
-          <CardHeader><CardTitle>Enable Shadow Policy</CardTitle></CardHeader>
+          <CardHeader><CardTitle>Configure a live comparison</CardTitle></CardHeader>
           <CardContent>
             <div className="flex gap-3">
-              <Input placeholder="Shadow version label" value={shadowVersion} onChange={(e) => setShadowVersion(e.target.value)} />
+              <label className="flex-1 text-sm">Proposed policy
+                <select className="block w-full mt-1 rounded-lg border border-surface-border bg-surface p-2" value={shadowVersion} onChange={e => setShadowVersion(e.target.value)}>
+                  <option value="">Choose an available policy version</option>
+                  {versions.filter(v => v !== stats?.active_version).map(v => <option value={v} key={v}>{v}</option>)}
+                </select>
+              </label>
               <Button onClick={() => shadowVersion && enableMut.mutate(shadowVersion)} loading={enableMut.isPending} disabled={!shadowVersion}>
-                <Ghost className="w-4 h-4" />Enable
+                <Ghost className="w-4 h-4" />Configure
               </Button>
             </div>
           </CardContent>
@@ -729,7 +747,7 @@ function ShadowPolicyPanel({ canPublish }: { canPublish: boolean }) {
         open={showDisableConfirm}
         onClose={() => setShowDisableConfirm(false)}
         onConfirm={() => disableMut.mutate()}
-        title="Disable Shadow Policy?"
+        title="Stop live comparison?"
         description="This will stop shadow evaluation. The active policy will continue serving all requests."
         confirmLabel="Disable"
         loading={disableMut.isPending}
