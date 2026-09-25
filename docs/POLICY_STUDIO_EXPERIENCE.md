@@ -85,3 +85,97 @@ These tests use mocked API responses. No production deployment is included.
 Final browser run: nine passed; the nginx-only header test was skipped on the
 Vite preview. The legacy-condition test also exposed and verified a fix for the
 rule editor's backdrop intercepting clicks (explicit dialog z-index).
+
+## Production-readiness review — 25 September 2026
+
+The previous passes improved the wording and screens, but the workflow behind
+them could not take a proposal live. Verified against a database built by
+`alembic upgrade head`:
+
+- **Upload failed on a migrated database.** Instances reference
+  `bpm_process_definitions`, which only the retired startup DDL seeded.
+- **Every stage change failed.** `BPMService.transition()` writes
+  `bpm_process_instances.updated_at`, a column the baseline never had. Approval,
+  rejection, compile and the publish endpoint's final step all returned 500.
+- **Nothing advanced a proposal.** No UI or server path moved it past DRAFT, so
+  the wizard's launch step was permanently blocked. Meanwhile any KB editor could
+  call the generic transition endpoint to reach PENDING_APPROVAL → ACTIVE, which
+  showed a version as live that the runtime never served.
+- **Publishing failed** whenever the SOP introduced anything new:
+  `master_action_codes.action_key` was not supplied (NOT NULL), and the taxonomy
+  upsert named a unique constraint that does not exist. Wizard proposals also
+  never received the compiled `policy_versions` row and vectorization that
+  activation requires.
+- **Reviewed new responses were silently dropped** during rule generation,
+  because they were only registered at publish. L3/L4 rules recorded the parent
+  (not the root) as their L1 category. Truncated, colliding rule IDs were possible.
+- **Rule editor writes silently rolled back while reporting success.**
+  SQLAlchemy does not bind `:param::jsonb`; the swallowed training-sample failure
+  aborted the transaction, and COMMIT became a rollback. Manual rule add in the
+  wizard sent fields the API does not accept, and the action dropdown endpoint
+  selected columns that do not exist. The same cast bug broke KB creation and
+  three CRM writes.
+- **Governance gaps:** rule routes had no KB membership check and could edit the
+  live version directly; instance endpoints accepted an instance from any KB
+  through an authorised KB's URL; approvals were not checked against their own
+  KB; a submitter could approve their own change; upload size was unbounded.
+- **The sample replay used the opposite precedence to the runtime**
+  (`priority DESC` vs the worker's `priority ASC`), so the gate measured a
+  different policy from the one that would run.
+
+Now implemented (`app/admin/services/policy_lifecycle.py`):
+
+- Stages advance only as their work completes: analysis → rules generated
+  (RULE_EDIT) → sample replay (SHADOW_GATE, or SIMULATION_FAILED) → approval
+  request (PENDING_APPROVAL) → approval by a second policy administrator (ACTIVE).
+  With no live policy, the replay is recorded as *not applicable*, not as a rate.
+  A change above the threshold needs a written justification to request
+  approval. The manual transition endpoint can only reopen a proposal; nothing
+  can be moved to ACTIVE by hand.
+- Editing a tested proposal returns it to RULE_EDIT. Nothing can be edited while
+  it awaits approval or is live, including through the advanced rule editor.
+  Late-finishing AI analysis re-checks this before it writes.
+- Submitting freezes the rules (fingerprint), creates the compiled version and
+  queues vectorization. Approval refuses until preparation completes and the
+  rules still match the fingerprint.
+- Activation is one transaction: registry commit, runtime pointer and active
+  flag, approval record, ACTIVE stage, and retirement of the previously live
+  proposal. A failure at any step changes none of them.
+- `POLICY_REQUIRE_SEPARATE_APPROVER` (default `true`) enforces separation of
+  duties. The wizard ends with an approval request; approval happens in the
+  proposal drawer, which shows readiness evidence and the version being replaced.
+- Proposals can be resumed from the board. Rules are no longer regenerated (and
+  manual edits lost) on every return to step 5. Server error explanations are
+  shown instead of HTTP status text. The UI reports when an SOP was longer than
+  the 12,000 characters analysed. LLM proposals are validated, and an unconfirmed
+  "existing" claim is no longer auto-accepted.
+
+Validation: 244 backend unit tests; 16 PostgreSQL integration tests, including
+two new end-to-end Policy Studio journeys over HTTP (only the LLM is stubbed)
+that cover a failed-activation rollback, separation of duties, editing locks,
+rejection and replacement of a live version; migration upgrade → downgrade base
+→ upgrade rehearsal; strict TypeScript build; 11 Playwright tests (nginx-only
+header test skipped on preview). Coverage floor raised from 34.98% to 36.90%. No production
+deployment is included.
+
+Remaining limits, not addressed here:
+
+- **One live policy for the whole runtime.** `kb_runtime_config` is read as a
+  single pointer by the Cardinal pipeline, so approving a proposal from any KB
+  replaces the policy for all tickets. The approval screen states this. Per-KB
+  runtime policies are an architectural change.
+- **Live comparison (shadow) is still not evaluated in the pipeline.** Approval
+  shows the recorded case count, currently zero. SHADOW_GATE therefore means
+  "tested on samples", not "observed live".
+- **The replay is an approximation.** The runtime chooses actions with an LLM
+  over rule candidates; the replay applies rules first-match. Sample cases carry
+  one issue type, so a specific (L2) rule cannot be distinguished from its
+  category there.
+- **Legacy publication routes remain:** `POST /kb/publish` and `/kb/rollback`
+  now require `policy.admin` (previously `knowledgeBase.admin` alone) and record
+  the authenticated publisher rather than a client-supplied name, but they still
+  activate versions without an approval record. Rollback is kept for emergencies.
+  Taxonomy-version approval still only changes its stage. Route these through
+  `policy_lifecycle` before relying on the approval trail as a complete control.
+- Proposals awaiting approval before this revision must be re-submitted once so
+  their runtime preparation is created.

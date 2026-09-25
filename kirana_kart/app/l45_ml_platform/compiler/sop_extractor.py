@@ -95,6 +95,101 @@ def _get_accepted_taxonomy(conn, kb_id: str, entity_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# The prompt carries at most this much SOP text. Callers report when a
+# document was longer, so reviewers know which part was never analysed.
+SOP_CHAR_LIMIT = 12000
+
+_PROPOSAL_TYPES = {"new", "update", "existing"}
+
+
+def sop_truncated(sop_text: str) -> bool:
+    return len(sop_text or "") > SOP_CHAR_LIMIT
+
+
+def _code(value: Any, max_len: int) -> str:
+    """Normalise an LLM-supplied code to SCREAMING_SNAKE_CASE within column limits."""
+    raw = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
+    return "".join(c for c in raw if c.isalnum() or c == "_")[:max_len]
+
+
+def _confidence(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if 0.0 <= number <= 1.0 else None
+
+
+def _clean_taxonomy(raw: Any, known_codes: set[str]) -> list[dict]:
+    """
+    Keep only proposals the schema can store. An LLM claim of
+    proposal_type='existing' is trusted only when the registry confirms the
+    code, because 'existing' proposals are accepted without human review.
+    """
+    cleaned: dict[str, dict] = {}
+    for p in raw if isinstance(raw, list) else []:
+        if not isinstance(p, dict):
+            continue
+        code = _code(p.get("issue_code"), 80)
+        label = str(p.get("label") or "").strip()[:255]
+        try:
+            level = int(p.get("level", 1))
+        except (TypeError, ValueError):
+            continue
+        if not code or not label or not 1 <= level <= 4 or code in cleaned:
+            continue
+        parent = _code(p.get("parent_code"), 80) or None
+        ptype = p.get("proposal_type") if p.get("proposal_type") in _PROPOSAL_TYPES else "new"
+        if ptype == "existing" and code not in known_codes:
+            ptype = "new"
+        cleaned[code] = {
+            **p,
+            "issue_code": code, "label": label, "level": level,
+            "parent_code": None if level == 1 else parent,
+            "description": str(p.get("description") or "").strip(),
+            "proposal_type": ptype,
+            "extraction_confidence": _confidence(p.get("extraction_confidence")),
+        }
+    return list(cleaned.values())
+
+
+def _clean_actions(raw: Any, known_codes: set[str]) -> list[dict]:
+    cleaned: dict[str, dict] = {}
+    for p in raw if isinstance(raw, list) else []:
+        if not isinstance(p, dict):
+            continue
+        code = _code(p.get("action_code_id"), 100)
+        name = str(p.get("action_name") or "").strip()[:255]
+        if not code or not name or code in cleaned:
+            continue
+        parents = p.get("parent_issue_codes") or []
+        parents = sorted({_code(c, 80) for c in parents if _code(c, 80)}) if isinstance(parents, list) else []
+        ptype = p.get("proposal_type") if p.get("proposal_type") in _PROPOSAL_TYPES else "new"
+        if ptype == "existing" and code not in known_codes:
+            ptype = "new"
+        cleaned[code] = {
+            **p,
+            "action_code_id": code, "action_name": name,
+            "action_description": str(p.get("action_description") or "").strip(),
+            "exact_action": str(p.get("exact_action") or "").strip(),
+            "parent_issue_codes": parents,
+            "requires_refund": bool(p.get("requires_refund", False)),
+            "requires_escalation": bool(p.get("requires_escalation", False)),
+            "automation_eligible": bool(p.get("automation_eligible", True)),
+            "proposal_type": ptype,
+            "extraction_confidence": _confidence(p.get("extraction_confidence")),
+        }
+    return list(cleaned.values())
+
+
+def _effective(row: dict) -> dict:
+    """A proposal as the reviewer left it: their edits over the extracted values."""
+    edits = row.get("user_output") or {}
+    if isinstance(edits, str):
+        edits = json.loads(edits)
+    return {**row, **{k: v for k, v in edits.items() if v is not None}}
+
+
 def _call_llm(system: str, user: str) -> dict:
     resp = _llm().chat.completions.create(
         model="gpt-4.1",
@@ -133,7 +228,8 @@ Return strict JSON only. No markdown.
 """
 
 
-def extract_taxonomy(engine: Engine, kb_id: str, entity_id: str, sop_text: str) -> list[dict]:
+def extract_taxonomy(engine: Engine, kb_id: str, entity_id: str, sop_text: str,
+                     before_write=None) -> list[dict]:
     """
     Stage 1: LLM reads SOP → proposes taxonomy nodes.
     Writes to draft_taxonomy_proposals. Returns list of proposals.
@@ -153,7 +249,7 @@ def extract_taxonomy(engine: Engine, kb_id: str, entity_id: str, sop_text: str) 
 {standards_block}
 
 SOP DOCUMENT:
-{sop_text[:12000]}
+{sop_text[:SOP_CHAR_LIMIT]}
 
 Return JSON:
 {{
@@ -171,9 +267,13 @@ Return JSON:
 }}"""
 
     result = _call_llm(_TAXONOMY_SYSTEM, user_prompt)
-    proposals = result.get("taxonomy", [])
+    proposals = _clean_taxonomy(result.get("taxonomy"), {r["issue_code"] for r in existing})
 
     with engine.begin() as conn:
+        # The LLM call ran outside any lock; the caller re-checks that the
+        # proposal may still change before its proposals are replaced.
+        if before_write:
+            before_write(conn)
         # Clear any existing proposals for this entity (idempotent re-run)
         conn.execute(text("""
             DELETE FROM kirana_kart.draft_taxonomy_proposals
@@ -252,7 +352,8 @@ Return strict JSON only. No markdown.
 """
 
 
-def extract_actions(engine: Engine, kb_id: str, entity_id: str, sop_text: str) -> list[dict]:
+def extract_actions(engine: Engine, kb_id: str, entity_id: str, sop_text: str,
+                     before_write=None) -> list[dict]:
     """
     Stage 2: LLM reads SOP + accepted taxonomy → proposes action codes.
     Writes to draft_action_proposals. Returns list of proposals.
@@ -282,7 +383,7 @@ EXISTING ACTION REGISTRY:
 {standards_block}
 
 SOP DOCUMENT:
-{sop_text[:12000]}
+{sop_text[:SOP_CHAR_LIMIT]}
 
 Return JSON:
 {{
@@ -303,9 +404,11 @@ Return JSON:
 }}"""
 
     result = _call_llm(_ACTION_SYSTEM, user_prompt)
-    proposals = result.get("actions", [])
+    proposals = _clean_actions(result.get("actions"), {r["action_code_id"] for r in existing_actions})
 
     with engine.begin() as conn:
+        if before_write:
+            before_write(conn)
         conn.execute(text("""
             DELETE FROM kirana_kart.draft_action_proposals
             WHERE kb_id = :kb_id AND entity_id = :eid
@@ -363,190 +466,278 @@ Return JSON:
 # Stage 3 — Rule Generation (deterministic, no LLM)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_rules(engine: Engine, kb_id: str, entity_id: str) -> list[dict]:
+def _issue_ancestry(conn, taxonomy_by_code: dict[str, dict]) -> dict[str, str | None]:
+    """
+    Map every accepted issue code to its level-1 root: rule_registry stores a
+    rule's issue as (issue_type_l1 = root, issue_type_l2 = the node itself).
+    Parents may be accepted proposals or codes already in the live taxonomy.
+    Unresolvable ancestry maps to None.
+    """
+    existing = {
+        r["issue_code"]: r for r in conn.execute(text("""
+            SELECT c.issue_code, c.level, p.issue_code AS parent_code
+            FROM kirana_kart.issue_taxonomy c
+            LEFT JOIN kirana_kart.issue_taxonomy p ON p.id = c.parent_id
+            WHERE c.is_active = TRUE
+        """)).mappings().all()
+    }
+
+    def root(code: str, depth: int = 0) -> str | None:
+        node = taxonomy_by_code.get(code) or existing.get(code)
+        if not node or depth > 4:
+            return None
+        if node["level"] == 1:
+            return code
+        return root(node["parent_code"], depth + 1) if node.get("parent_code") else None
+
+    return {code: root(code) for code in taxonomy_by_code}
+
+
+def taxonomy_problems(conn, kb_id: str, entity_id: str) -> list[str]:
+    """
+    Accepted categories that cannot be stored: issue_taxonomy requires every
+    level 2-4 node to have a resolvable parent (chk_parent_level). Found here,
+    before approval, rather than as a failed activation.
+    """
+    taxonomy = {t["issue_code"]: t for t in _get_accepted_taxonomy(conn, kb_id, entity_id)}
+    ancestry = _issue_ancestry(conn, taxonomy)
+    return [
+        f"{code} has no accepted or existing parent category"
+        for code, node in taxonomy.items()
+        if node["level"] > 1 and ancestry.get(code) is None
+    ]
+
+
+def _rule_id(issue_code: str, action_code: str) -> str:
+    """Deterministic and collision-free: truncated readable prefix + digest."""
+    import hashlib
+    digest = hashlib.sha1(f"{issue_code}|{action_code}".encode()).hexdigest()[:8].upper()
+    return f"R-{issue_code[:24]}-{action_code[:24]}-{digest}"
+
+
+def generate_rules(engine: Engine, kb_id: str, entity_id: str, conn=None) -> dict:
     """
     Stage 3: Deterministic join of accepted taxonomy × accepted action proposals.
     For each (issue_code, action_code_id) pair where the issue is in the action's
     parent_issue_codes, generate one rule in rule_registry.
 
-    Returns list of generated rule dicts.
+    Accepted actions that are new to master_action_codes are registered here:
+    a rule must reference a real action id, and dropping them (the previous
+    behaviour) silently discarded every reviewed response the SOP introduced.
+    A new code is inert until a live policy's rules reference it; publication
+    later applies the reviewer's final wording (commit_proposals_to_registry).
+
+    Returns {"rules": [...], "skipped": [...]} — skipped explains every
+    accepted pairing that could not become a rule.
     """
-    with engine.begin() as conn:
-        taxonomy = _get_accepted_taxonomy(conn, kb_id, entity_id)
-        actions_rows = conn.execute(text("""
-            SELECT action_code_id, action_name, action_description, exact_action,
-                   parent_issue_codes, requires_refund, requires_escalation, automation_eligible
-            FROM kirana_kart.draft_action_proposals
-            WHERE kb_id = :kb_id AND entity_id = :eid
-              AND status IN ('accepted', 'edited')
-        """), {"kb_id": kb_id, "eid": entity_id}).mappings().all()
-        actions = [dict(r) for r in actions_rows]
+    if conn is None:
+        with engine.begin() as own:
+            return generate_rules(engine, kb_id, entity_id, conn=own)
 
-        # Get action db id mapping
-        action_id_map: dict[str, int] = {}
-        for a in actions:
-            row = conn.execute(text("""
-                SELECT id FROM kirana_kart.master_action_codes
-                WHERE action_code_id = :code
-            """), {"code": a["action_code_id"]}).fetchone()
-            if row:
-                action_id_map[a["action_code_id"]] = row[0]
+    taxonomy = _get_accepted_taxonomy(conn, kb_id, entity_id)
+    actions = [_effective(dict(r)) for r in conn.execute(text("""
+        SELECT action_code_id, action_name, action_description, exact_action,
+               parent_issue_codes, requires_refund, requires_escalation,
+               automation_eligible, user_output
+        FROM kirana_kart.draft_action_proposals
+        WHERE kb_id = :kb_id AND entity_id = :eid
+          AND status IN ('accepted', 'edited')
+        ORDER BY action_code_id
+    """), {"kb_id": kb_id, "eid": entity_id}).mappings().all()]
 
-        # Clear existing draft rules for this entity
+    action_id_map: dict[str, int] = {}
+    for a in actions:
         conn.execute(text("""
-            DELETE FROM kirana_kart.rule_registry
-            WHERE kb_id = :kb_id AND policy_version = :eid
-        """), {"kb_id": kb_id, "eid": entity_id})
+            INSERT INTO kirana_kart.master_action_codes
+                (action_key, action_code_id, action_name, action_description, exact_action,
+                 parent_issue_codes, requires_refund, requires_escalation, automation_eligible)
+            VALUES (:code, :code, :name, :desc, :exact, :parents, :refund, :esc, :auto)
+            ON CONFLICT (action_code_id) DO NOTHING
+        """), {
+            "code": a["action_code_id"], "name": a["action_name"],
+            "desc": a.get("action_description"), "exact": a.get("exact_action"),
+            "parents": list(a.get("parent_issue_codes") or []),
+            "refund": bool(a.get("requires_refund")), "esc": bool(a.get("requires_escalation")),
+            "auto": bool(a.get("automation_eligible", True)),
+        })
+        action_id_map[a["action_code_id"]] = conn.execute(text("""
+            SELECT id FROM kirana_kart.master_action_codes WHERE action_code_id = :code
+        """), {"code": a["action_code_id"]}).scalar()
 
-        taxonomy_by_code = {t["issue_code"]: t for t in taxonomy}
-        generated = []
+    conn.execute(text("""
+        DELETE FROM kirana_kart.rule_registry
+        WHERE kb_id = :kb_id AND policy_version = :eid
+    """), {"kb_id": kb_id, "eid": entity_id})
 
-        for action in actions:
-            parent_codes: list[str] = action["parent_issue_codes"] or []
-            action_db_id = action_id_map.get(action["action_code_id"])
-            if not action_db_id:
-                logger.warning("No master_action_codes row for %s — skipping", action["action_code_id"])
+    taxonomy_by_code = {t["issue_code"]: t for t in taxonomy}
+    ancestry = _issue_ancestry(conn, taxonomy_by_code)
+    generated: list[dict] = []
+    skipped: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    for action in actions:
+        for issue_code in sorted(set(action.get("parent_issue_codes") or [])):
+            pair = (issue_code, action["action_code_id"])
+            tax_node = taxonomy_by_code.get(issue_code)
+            if not tax_node:
+                skipped.append({"issue_code": issue_code, "action_code_id": pair[1],
+                                "reason": "Customer problem was not accepted in this proposal"})
                 continue
+            root = ancestry.get(issue_code)
+            if root is None:
+                skipped.append({"issue_code": issue_code, "action_code_id": pair[1],
+                                "reason": "Customer problem has no accepted or existing parent category"})
+                continue
+            if pair in seen:
+                continue
+            seen.add(pair)
 
-            for issue_code in parent_codes:
-                tax_node = taxonomy_by_code.get(issue_code)
-                if not tax_node:
-                    continue
+            level = tax_node["level"]
+            issue_l2 = issue_code if level >= 2 else None
+            # First-match evaluation is priority ASC (lower wins). A more
+            # specific situation must outrank its general category.
+            priority = 500 - 100 * (level - 1)
+            rule_id = _rule_id(issue_code, action["action_code_id"])
 
-                # Determine L1 and L2
-                level = tax_node["level"]
-                issue_l1 = issue_code if level == 1 else tax_node.get("parent_code") or issue_code
-                issue_l2 = issue_code if level >= 2 else None
+            conn.execute(text("""
+                INSERT INTO kirana_kart.rule_registry
+                    (kb_id, rule_id, policy_version, module_name, rule_type,
+                     priority, issue_type_l1, issue_type_l2, action_id,
+                     deterministic, overrideable, conditions, flags)
+                VALUES
+                    (:kb_id, :rule_id, :version, 'default', 'issue_resolution',
+                     :priority, :l1, :l2, :action_id,
+                     :auto, FALSE, '{}', '{}')
+            """), {
+                "kb_id": kb_id,
+                "rule_id": rule_id,
+                "version": entity_id,
+                "priority": priority,
+                "l1": root,
+                "l2": issue_l2,
+                "action_id": action_id_map[action["action_code_id"]],
+                "auto": bool(action.get("automation_eligible", True)),
+            })
 
-                rule_id = f"R-{issue_code[:20]}-{action['action_code_id'][:20]}"
+            r = {
+                "rule_id": rule_id,
+                "issue_type_l1": root,
+                "issue_type_l2": issue_l2,
+                "action_code_id": action["action_code_id"],
+                "action_name": action["action_name"],
+                "exact_action": action.get("exact_action"),
+            }
+            generated.append(r)
 
-                conn.execute(text("""
-                    INSERT INTO kirana_kart.rule_registry
-                        (kb_id, rule_id, policy_version, module_name, rule_type,
-                         priority, issue_type_l1, issue_type_l2, action_id,
-                         deterministic, overrideable, conditions, flags)
-                    VALUES
-                        (:kb_id, :rule_id, :version, 'default', 'issue_resolution',
-                         100, :l1, :l2, :action_id,
-                         :auto, FALSE, '{}', '{}')
-                    ON CONFLICT DO NOTHING
-                """), {
-                    "kb_id": kb_id,
-                    "rule_id": rule_id,
-                    "version": entity_id,
-                    "l1": issue_l1,
-                    "l2": issue_l2,
-                    "action_id": action_db_id,
-                    "auto": action["automation_eligible"],
-                })
+            conn.execute(text("""
+                INSERT INTO kirana_kart.rule_edit_log
+                    (kb_id, entity_id, stage, item_ref, edit_type, llm_output)
+                VALUES (:kb_id, :eid, 'rule', :ref, 'accepted', :llm)
+            """), {
+                "kb_id": kb_id, "eid": entity_id,
+                "ref": rule_id, "llm": json.dumps(r),
+            })
 
-                r = {
-                    "rule_id": rule_id,
-                    "issue_type_l1": issue_l1,
-                    "issue_type_l2": issue_l2,
-                    "action_code_id": action["action_code_id"],
-                    "action_name": action["action_name"],
-                    "exact_action": action["exact_action"],
-                }
-                generated.append(r)
-
-                conn.execute(text("""
-                    INSERT INTO kirana_kart.rule_edit_log
-                        (kb_id, entity_id, stage, item_ref, edit_type, llm_output)
-                    VALUES (:kb_id, :eid, 'rule', :ref, 'accepted', :llm)
-                """), {
-                    "kb_id": kb_id, "eid": entity_id,
-                    "ref": rule_id, "llm": json.dumps(r),
-                })
-
-    logger.info("Stage 3 complete: %d rules generated for entity_id=%s", len(generated), entity_id)
-    return generated
+    logger.info(
+        "Stage 3 complete: %d rules generated, %d pairings skipped for entity_id=%s",
+        len(generated), len(skipped), entity_id,
+    )
+    return {"rules": generated, "skipped": skipped}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # On-Publish: Update Extraction Standards + commit proposals to global registries
 # ─────────────────────────────────────────────────────────────────────────────
 
-def commit_proposals_to_registry(engine: Engine, kb_id: str, entity_id: str, actor_id: int | None = None) -> None:
+def commit_proposals_to_registry(
+    engine: Engine, kb_id: str, entity_id: str, actor_id: int | None = None, conn=None,
+) -> None:
     """
     Called on publish. Promotes accepted draft proposals to the global registries:
     - draft_taxonomy_proposals (accepted/edited) → issue_taxonomy
     - draft_action_proposals (accepted/edited) → master_action_codes
     Then regenerates extraction_standards.md for this KB.
+
+    With `conn`, runs in the caller's transaction so a failed activation also
+    leaves the registries untouched.
     """
-    with engine.begin() as conn:
-        # Promote taxonomy proposals
-        tax_rows = conn.execute(text("""
-            SELECT * FROM kirana_kart.draft_taxonomy_proposals
-            WHERE kb_id = :kb_id AND entity_id = :eid
-              AND status IN ('accepted', 'edited') AND proposal_type = 'new'
-        """), {"kb_id": kb_id, "eid": entity_id}).mappings().all()
+    if conn is None:
+        with engine.begin() as own:
+            return commit_proposals_to_registry(engine, kb_id, entity_id, actor_id, conn=own)
 
-        for row in tax_rows:
-            effective = json.loads(row["user_output"]) if row["user_output"] else {}
-            label = effective.get("label", row["label"])
-            desc = effective.get("description", row["description"])
+    # Parents first: a new L2 may hang off a new L1 in the same proposal.
+    tax_rows = conn.execute(text("""
+        SELECT * FROM kirana_kart.draft_taxonomy_proposals
+        WHERE kb_id = :kb_id AND entity_id = :eid
+          AND status IN ('accepted', 'edited') AND proposal_type = 'new'
+        ORDER BY level, issue_code
+    """), {"kb_id": kb_id, "eid": entity_id}).mappings().all()
 
-            # Resolve parent_id from parent_code
-            parent_id = None
-            if row["parent_code"]:
-                pr = conn.execute(text("""
-                    SELECT id FROM kirana_kart.issue_taxonomy
-                    WHERE issue_code = :code AND kb_id = :kb_id
-                """), {"code": row["parent_code"], "kb_id": kb_id}).fetchone()
-                if pr:
-                    parent_id = pr[0]
+    for row in tax_rows:
+        effective = _effective(dict(row))
 
-            conn.execute(text("""
-                INSERT INTO kirana_kart.issue_taxonomy
-                    (kb_id, issue_code, label, description, parent_id, level, is_active)
-                VALUES (:kb_id, :code, :label, :desc, :parent, :level, TRUE)
-                ON CONFLICT (issue_code, kb_id) DO UPDATE
-                    SET label = EXCLUDED.label,
-                        description = EXCLUDED.description,
-                        updated_at = NOW()
-            """), {
-                "kb_id": kb_id,
-                "code": row["issue_code"],
-                "label": label,
-                "desc": desc,
-                "parent": parent_id,
-                "level": row["level"],
-            })
+        parent_id = None
+        if row["parent_code"]:
+            parent_id = conn.execute(text("""
+                SELECT id FROM kirana_kart.issue_taxonomy WHERE issue_code = :code
+            """), {"code": row["parent_code"]}).scalar()
+        if row["level"] > 1 and parent_id is None:
+            raise ValueError(
+                f"Category {row['issue_code']} has no parent category in the registry"
+            )
 
-        # Promote action proposals
-        act_rows = conn.execute(text("""
-            SELECT * FROM kirana_kart.draft_action_proposals
-            WHERE kb_id = :kb_id AND entity_id = :eid
-              AND status IN ('accepted', 'edited') AND proposal_type = 'new'
-        """), {"kb_id": kb_id, "eid": entity_id}).mappings().all()
+        # issue_code is globally unique. A code owned by another KB is left
+        # untouched rather than relabelled from this KB's SOP.
+        conn.execute(text("""
+            INSERT INTO kirana_kart.issue_taxonomy
+                (kb_id, issue_code, label, description, parent_id, level, is_active)
+            VALUES (:kb_id, :code, :label, :desc, :parent, :level, TRUE)
+            ON CONFLICT (issue_code) DO UPDATE
+                SET label = EXCLUDED.label,
+                    description = EXCLUDED.description,
+                    updated_at = NOW()
+                WHERE kirana_kart.issue_taxonomy.kb_id = EXCLUDED.kb_id
+        """), {
+            "kb_id": kb_id,
+            "code": row["issue_code"],
+            "label": effective.get("label", row["label"]),
+            "desc": effective.get("description", row["description"]),
+            "parent": parent_id,
+            "level": row["level"],
+        })
 
-        for row in act_rows:
-            effective = json.loads(row["user_output"]) if row["user_output"] else {}
-            conn.execute(text("""
-                INSERT INTO kirana_kart.master_action_codes
-                    (action_code_id, action_name, action_description, exact_action,
-                     parent_issue_codes, requires_refund, requires_escalation, automation_eligible)
-                VALUES
-                    (:code, :name, :desc, :exact, :parents, :refund, :esc, :auto)
-                ON CONFLICT (action_code_id) DO UPDATE
-                    SET action_name        = EXCLUDED.action_name,
-                        action_description = EXCLUDED.action_description,
-                        exact_action       = EXCLUDED.exact_action,
-                        parent_issue_codes = EXCLUDED.parent_issue_codes
-            """), {
-                "code": row["action_code_id"],
-                "name": effective.get("action_name", row["action_name"]),
-                "desc": effective.get("action_description", row["action_description"]),
-                "exact": effective.get("exact_action", row["exact_action"]),
-                "parents": effective.get("parent_issue_codes", row["parent_issue_codes"]) or [],
-                "refund": effective.get("requires_refund", row["requires_refund"]),
-                "esc": effective.get("requires_escalation", row["requires_escalation"]),
-                "auto": effective.get("automation_eligible", row["automation_eligible"]),
-            })
+    act_rows = conn.execute(text("""
+        SELECT * FROM kirana_kart.draft_action_proposals
+        WHERE kb_id = :kb_id AND entity_id = :eid
+          AND status IN ('accepted', 'edited') AND proposal_type = 'new'
+    """), {"kb_id": kb_id, "eid": entity_id}).mappings().all()
 
-        # Regenerate extraction_standards.md
-        _regenerate_standards(conn, kb_id, actor_id)
+    for row in act_rows:
+        effective = _effective(dict(row))
+        conn.execute(text("""
+            INSERT INTO kirana_kart.master_action_codes
+                (action_key, action_code_id, action_name, action_description, exact_action,
+                 parent_issue_codes, requires_refund, requires_escalation, automation_eligible)
+            VALUES
+                (:code, :code, :name, :desc, :exact, :parents, :refund, :esc, :auto)
+            ON CONFLICT (action_code_id) DO UPDATE
+                SET action_name        = EXCLUDED.action_name,
+                    action_description = EXCLUDED.action_description,
+                    exact_action       = EXCLUDED.exact_action,
+                    parent_issue_codes = EXCLUDED.parent_issue_codes
+        """), {
+            "code": row["action_code_id"],
+            "name": effective.get("action_name"),
+            "desc": effective.get("action_description"),
+            "exact": effective.get("exact_action"),
+            "parents": list(effective.get("parent_issue_codes") or []),
+            "refund": effective.get("requires_refund"),
+            "esc": effective.get("requires_escalation"),
+            "auto": effective.get("automation_eligible"),
+        })
+
+    # Regenerate extraction_standards.md
+    _regenerate_standards(conn, kb_id, actor_id)
 
     logger.info("Proposals committed to global registry for kb_id=%s entity_id=%s", kb_id, entity_id)
 

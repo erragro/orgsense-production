@@ -2,7 +2,7 @@
 from sqlalchemy import text
 from app.admin.db import engine
 
-SCHEMA_REVISION = '0007_group_key_hashes'
+SCHEMA_REVISION = '0008_policy_studio_lifecycle'
 
 
 def verify_schema():

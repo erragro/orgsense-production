@@ -76,113 +76,124 @@ class KBRegistryService:
     def publish_version(
         self,
         version_label: str,
-        published_by: str
+        published_by: str,
+        conn=None,
     ) -> Dict[str, Any]:
+        """
+        Snapshot and activate a compiled version. With `conn`, runs inside the
+        caller's transaction so activation commits or rolls back with the
+        caller's own writes (Policy Studio approval does this).
+        """
 
         version_label = version_label.strip()
 
-        with self.engine.begin() as conn:
+        if conn is None:
+            with self.engine.begin() as own:
+                return self._publish_on(own, version_label, published_by)
+        return self._publish_on(conn, version_label, published_by)
 
-            # ----------------------------------------------------
-            # Verify compiled version exists
-            # ----------------------------------------------------
+    def _publish_on(self, conn, version_label: str, published_by: str) -> Dict[str, Any]:
 
-            version_exists = conn.execute(text("""
-                SELECT 1
-                FROM kirana_kart.policy_versions
-                WHERE policy_version = :version_label
-            """), {
-                "version_label": version_label
-            }).scalar()
+        # ----------------------------------------------------
+        # Verify compiled version exists
+        # ----------------------------------------------------
 
-            if not version_exists:
-                raise Exception(
-                    f"Policy version '{version_label}' not compiled"
-                )
+        version_exists = conn.execute(text("""
+            SELECT 1
+            FROM kirana_kart.policy_versions
+            WHERE policy_version = :version_label
+        """), {
+            "version_label": version_label
+        }).scalar()
 
-            # ----------------------------------------------------
-            # Verify vectorization completed
-            # ----------------------------------------------------
+        if not version_exists:
+            raise Exception(
+                f"Policy version '{version_label}' not compiled"
+            )
 
-            vector_status = conn.execute(text("""
-                SELECT vector_status
-                FROM kirana_kart.policy_versions
-                WHERE policy_version = :version_label
-            """), {
-                "version_label": version_label
-            }).scalar()
+        # ----------------------------------------------------
+        # Verify vectorization completed
+        # ----------------------------------------------------
 
-            if vector_status != "completed":
-                raise Exception(
-                    f"Policy version '{version_label}' cannot be published until vectorization completes"
-                )
+        vector_status = conn.execute(text("""
+            SELECT vector_status
+            FROM kirana_kart.policy_versions
+            WHERE policy_version = :version_label
+        """), {
+            "version_label": version_label
+        }).scalar()
 
-            # ----------------------------------------------------
-            # Prevent duplicate publishing
-            # ----------------------------------------------------
+        if vector_status != "completed":
+            raise Exception(
+                f"Policy version '{version_label}' cannot be published until vectorization completes"
+            )
 
-            already_published = conn.execute(text("""
-                SELECT 1
-                FROM kirana_kart.knowledge_base_versions
-                WHERE version_label = :version_label
-            """), {
-                "version_label": version_label
-            }).scalar()
+        # ----------------------------------------------------
+        # Prevent duplicate publishing
+        # ----------------------------------------------------
 
-            if already_published:
-                raise Exception(
-                    f"Version '{version_label}' already published"
-                )
+        already_published = conn.execute(text("""
+            SELECT 1
+            FROM kirana_kart.knowledge_base_versions
+            WHERE version_label = :version_label
+        """), {
+            "version_label": version_label
+        }).scalar()
 
-            # ----------------------------------------------------
-            # Snapshot rule registry
-            # ----------------------------------------------------
+        if already_published:
+            raise Exception(
+                f"Version '{version_label}' already published"
+            )
 
-            rules = conn.execute(text("""
-                SELECT *
-                FROM kirana_kart.rule_registry
-                WHERE policy_version = :version_label
-            """), {
-                "version_label": version_label
-            }).mappings().all()
+        # ----------------------------------------------------
+        # Snapshot rule registry
+        # ----------------------------------------------------
 
-            if not rules:
-                raise Exception(
-                    "No compiled rules found for this version"
-                )
+        rules = conn.execute(text("""
+            SELECT *
+            FROM kirana_kart.rule_registry
+            WHERE policy_version = :version_label
+        """), {
+            "version_label": version_label
+        }).mappings().all()
 
-            snapshot = [dict(r) for r in rules]
+        if not rules:
+            raise Exception(
+                "No compiled rules found for this version"
+            )
 
-            conn.execute(text("""
-                INSERT INTO kirana_kart.knowledge_base_versions (
-                    version_label,
-                    status,
-                    created_by,
-                    snapshot_data
-                )
-                VALUES (
-                    :version_label,
-                    'published',
-                    :created_by,
-                    :snapshot
-                )
-            """), {
-                "version_label": version_label,
-                "created_by": published_by,
-                "snapshot": json.dumps(snapshot, default=str)
-            })
+        snapshot = [dict(r) for r in rules]
 
-            # ----------------------------------------------------
-            # Activate runtime version
-            # ----------------------------------------------------
+        conn.execute(text("""
+            INSERT INTO kirana_kart.knowledge_base_versions (
+                version_label,
+                status,
+                created_by,
+                snapshot_data
+            )
+            VALUES (
+                :version_label,
+                'published',
+                :created_by,
+                :snapshot
+            )
+        """), {
+            "version_label": version_label,
+            "created_by": published_by,
+            "snapshot": json.dumps(snapshot, default=str)
+        })
 
-            self._activate_version(conn, version_label)
+        # ----------------------------------------------------
+        # Activate runtime version
+        # ----------------------------------------------------
 
-            # NOTE: No kb_vector_jobs insert here.
-            # Vectorization is confirmed complete by the vector_status
-            # gate above. Inserting a job here would trigger a redundant
-            # second vectorization run, doubling embedding cost and
-            # overwriting the Weaviate index unnecessarily on every publish.
+        self._activate_version(conn, version_label)
+
+        # NOTE: No kb_vector_jobs insert here.
+        # Vectorization is confirmed complete by the vector_status
+        # gate above. Inserting a job here would trigger a redundant
+        # second vectorization run, doubling embedding cost and
+        # overwriting the Weaviate index unnecessarily on every publish.
 
         return {
             "status": "published",

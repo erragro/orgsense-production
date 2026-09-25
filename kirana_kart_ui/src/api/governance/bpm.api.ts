@@ -5,13 +5,15 @@
 
 import { governanceClient as apiClient } from '../clients'
 
+const ANALYSIS_TIMEOUT_MS = 180_000
+
 // ============================================================
 // TYPES
 // ============================================================
 
 export type KBRole = 'view' | 'edit' | 'admin'
 export type EntityType = 'kb_version' | 'taxonomy_version'
-export type ApprovalStatus = 'pending' | 'approved' | 'rejected'
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'superseded'
 export type GateType = 'simulation' | 'shadow' | 'diff_review'
 
 export interface KnowledgeBase {
@@ -147,6 +149,63 @@ export interface ReviewProposalPayload {
   user_output?: Record<string, unknown>
 }
 
+export interface AnalysisResult<T> {
+  proposals: T[]
+  count: number
+  /** The document is longer than the part the analysis read. */
+  truncated: boolean
+  analysed_characters: number
+  document_characters: number
+}
+
+export interface SkippedPairing {
+  issue_code: string
+  action_code_id: string
+  reason: string
+}
+
+export interface GateMetrics {
+  status?: 'not_applicable'
+  reason?: string
+  unchanged_rate?: number
+  changed_count?: number
+  ticket_count?: number
+  rule_count: number
+  baseline_version?: string
+  candidate_version: string
+  threshold?: number
+  sample_source?: string
+  measurement_scope?: string
+  examples?: Array<{ ticket_id: string | number; baseline: string; candidate: string }>
+}
+
+export interface SimulationGateResult {
+  status: 'ok' | 'not_applicable' | 'unavailable'
+  passed: boolean | null
+  reason?: string | null
+  metrics: GateMetrics | null
+  examples?: Array<{ ticket_id: string | number; baseline: string; candidate: string }>
+  stage?: string
+}
+
+export interface ProposalReadiness {
+  stage: string
+  review: {
+    taxonomy_pending: number
+    taxonomy_accepted: number
+    actions_pending: number
+    actions_accepted: number
+    rules: number
+  }
+  /** Runtime preparation (vectorization) of the submitted rules. */
+  preparation_status: 'pending' | 'in_progress' | 'completed' | 'failed' | null
+  rules_unchanged_since_submission: boolean
+  pending_approval: { id: number; requested_by_id: number | null; requested_by: string | null; requested_at: string } | null
+  live_version: string | null
+  live_comparison_version: string | null
+  live_comparison_cases: number
+}
+
 export interface GeneratedRule {
   rule_id: string
   issue_type_l1: string
@@ -218,9 +277,24 @@ export const bpmApi = {
   getPendingApprovals: (kbId: string, instanceId: number) =>
     apiClient.get<BPMApproval[]>(`/bpm/${kbId}/instances/${instanceId}/approvals`),
 
-  requestApproval: (kbId: string, instanceId: number, stage: string) =>
-    apiClient.post<BPMApproval>(`/bpm/${kbId}/instances/${instanceId}/request-approval`, {
-      stage,
+  // --- Policy Studio lifecycle (server advances the stage) ---
+
+  simulate: (kbId: string, entityId: string) =>
+    apiClient.post<SimulationGateResult>(`/bpm/kb/${kbId}/simulate`, { entity_id: entityId }),
+
+  submitForApproval: (kbId: string, entityId: string, justification?: string) =>
+    apiClient.post<{ approval: BPMApproval | null; stage: string }>(`/bpm/kb/${kbId}/submit`, {
+      entity_id: entityId,
+      justification,
+    }),
+
+  getReadiness: (kbId: string, entityId: string) =>
+    apiClient.get<ProposalReadiness>(`/bpm/kb/${kbId}/proposals/${entityId}/readiness`),
+
+  reopenForEditing: (kbId: string, instanceId: number, notes?: string) =>
+    apiClient.post<BPMInstance>(`/bpm/${kbId}/instances/${instanceId}/transition`, {
+      to_stage: 'RULE_EDIT',
+      notes,
     }),
 
   // --- Approval Actions ---
@@ -241,8 +315,10 @@ export const bpmApi = {
 
   // --- SOP Extraction Pipeline ---
 
+  // LLM analysis of a long SOP can exceed the client's default 30 s.
   extractTaxonomy: (kbId: string, entityId: string) =>
-    apiClient.post<TaxonomyProposal[]>(`/bpm/kb/${kbId}/extract-taxonomy`, { entity_id: entityId }),
+    apiClient.post<AnalysisResult<TaxonomyProposal>>(`/bpm/kb/${kbId}/extract-taxonomy`,
+      { entity_id: entityId }, { timeout: ANALYSIS_TIMEOUT_MS }),
 
   listTaxonomyProposals: (kbId: string, entityId: string) =>
     apiClient.get<TaxonomyProposal[]>(`/bpm/kb/${kbId}/taxonomy-proposals`, { params: { entity_id: entityId } }),
@@ -251,7 +327,8 @@ export const bpmApi = {
     apiClient.put<TaxonomyProposal>(`/bpm/kb/${kbId}/taxonomy-proposals/${proposalId}`, payload),
 
   extractActions: (kbId: string, entityId: string) =>
-    apiClient.post<ActionProposal[]>(`/bpm/kb/${kbId}/extract-actions`, { entity_id: entityId }),
+    apiClient.post<AnalysisResult<ActionProposal>>(`/bpm/kb/${kbId}/extract-actions`,
+      { entity_id: entityId }, { timeout: ANALYSIS_TIMEOUT_MS }),
 
   listActionProposals: (kbId: string, entityId: string) =>
     apiClient.get<ActionProposal[]>(`/bpm/kb/${kbId}/action-proposals`, { params: { entity_id: entityId } }),
@@ -260,8 +337,9 @@ export const bpmApi = {
     apiClient.put<ActionProposal>(`/bpm/kb/${kbId}/action-proposals/${proposalId}`, payload),
 
   generateRules: (kbId: string, entityId: string) =>
-    apiClient.post<GeneratedRule[]>(`/bpm/kb/${kbId}/generate-rules`, { entity_id: entityId }),
+    apiClient.post<{ rules: GeneratedRule[]; skipped: SkippedPairing[]; count: number; stage: string }>(
+      `/bpm/kb/${kbId}/generate-rules`, { entity_id: entityId }),
 
   getExtractionStandards: (kbId: string) =>
-    apiClient.get<{ kb_id: string; content: string; updated_at: string }>(`/bpm/standards/${kbId}`),
+    apiClient.get<{ standards_md: string; version: number; updated_at: string | null }>(`/bpm/standards/${kbId}`),
 }

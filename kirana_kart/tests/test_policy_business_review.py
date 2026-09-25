@@ -20,14 +20,19 @@ def test_upload_saves_business_intent_with_proposal():
 
 @pytest.mark.parametrize('stage', ['RULE_EDIT', 'SIMULATION_GATE', 'SHADOW_GATE'])
 def test_early_stage_cannot_activate_before_transition_validation(stage):
+    from tests.policy_fakes import FakeConn
+    conn = FakeConn(stage=stage)
     engine = MagicMock()
-    engine.connect.return_value.__enter__.return_value.execute.return_value.mappings.return_value.first.return_value = {'id': 1, 'current_stage': stage}
-    with patch.object(bpm_routes, 'engine', engine), patch('app.l1_ingestion.kb_registry.kb_registry_service.KBRegistryService') as registry, patch('app.l45_ml_platform.compiler.sop_extractor.commit_proposals_to_registry') as commit:
+    engine.begin.return_value.__enter__.return_value = conn
+    with patch.object(bpm_routes, 'engine', engine), patch.object(bpm_routes, '_require_kb_access'), \
+         patch('app.l1_ingestion.kb_registry.kb_registry_service.KBRegistryService') as registry, \
+         patch('app.l45_ml_platform.compiler.sop_extractor.commit_proposals_to_registry') as commit:
         with pytest.raises(HTTPException) as error:
-            bpm_routes.publish_version_bpm('default', {'entity_id': 'proposal'}, MagicMock())
-        assert error.value.status_code == 400
+            bpm_routes.publish_version_bpm('default', bpm_routes.PublishRequest(entity_id='proposal'), MagicMock())
+        assert error.value.status_code == 409
         registry.assert_not_called()
         commit.assert_not_called()
+    assert conn.transitions == []
 
 
 def test_shadow_statistics_scope_to_current_version_pair():
@@ -67,9 +72,10 @@ def test_publish_requires_access_to_selected_kb():
     with patch.object(bpm_routes, '_bpm_service') as bpm, patch.object(bpm_routes, 'engine') as engine:
         bpm.check_kb_access.return_value = False
         with pytest.raises(HTTPException) as error:
-            bpm_routes.publish_version_bpm('restricted', {'entity_id': 'proposal'}, actor)
+            bpm_routes.publish_version_bpm('restricted', bpm_routes.PublishRequest(entity_id='proposal'), actor)
     assert error.value.status_code == 403
     engine.connect.assert_not_called()
+    engine.begin.assert_not_called()
 
 
 def test_proposal_lookup_filters_before_limit():

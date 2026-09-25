@@ -66,7 +66,13 @@ recorded in `kirana_kart/coverage-floor.json`; it does not invent a target perce
 6. APIs now require the exact schema revision; production also requires a valid
    32-byte PII key and completed customer backfill. Startup failure is intentional
    if either prerequisite is absent. Liveness is `/health`; readiness is `/ready`.
-7. Deploy `worker-beat` as **one** replica with Recreate, and workers consuming
+7. Policy Studio (revision 0008) needs the governance API's vector background
+   worker running: an approver cannot activate a submitted policy change until its
+   runtime preparation (vectorization) completes. `POLICY_REQUIRE_SEPARATE_APPROVER`
+   defaults to `true` (the submitter cannot approve their own change); set it to
+   `false` only for a single-owner deployment. Proposals already awaiting approval
+   before this revision must be re-submitted (Retry runtime preparation) once.
+8. Deploy `worker-beat` as **one** replica with Recreate, and workers consuming
    both `cardinal` and `celery` queues. Verify a retention task actually executes.
    Cloud Run worker deployments need continuous CPU/instances appropriate to
    background processing; the repository does not provision those settings.

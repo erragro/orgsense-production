@@ -523,7 +523,7 @@ class PolicySimulationService:
                 FROM kirana_kart.rule_registry rr
                 LEFT JOIN kirana_kart.master_action_codes mac ON mac.id = rr.action_id
                 WHERE rr.policy_version = :v
-                ORDER BY rr.priority DESC
+                ORDER BY rr.priority ASC, rr.rule_id ASC
             """), {"v": version}).mappings().all()
 
         if not rows:
@@ -572,8 +572,9 @@ class PolicySimulationService:
 
     def _evaluate_with_trace(self, ticket_ctx: dict, rules: list) -> dict:
         """
-        Evaluate ticket against all rules (priority-ordered, highest first).
-        The first matching rule is the decisive action.
+        Evaluate ticket against all rules in runtime precedence order
+        (priority ASC — a lower number wins — as worker._fetch_rules loads
+        them). The first matching rule is the decisive action.
         Returns trace list + summary.
         """
         trace = []
@@ -638,6 +639,15 @@ class PolicySimulationService:
                 reasons.append(
                     f"issue_type_l1: expected '{rule['issue_type_l1']}', got '{ticket_l1}'"
                 )
+
+        # issue_type_l2 — checked only when the ticket carries one. Saved
+        # simulation cases record a single issue type, so a specific rule
+        # cannot be distinguished from its category there.
+        ticket_l2 = ticket.get("issue_type_l2")
+        if rule.get("issue_type_l2") and ticket_l2 and ticket_l2 != rule["issue_type_l2"]:
+            reasons.append(
+                f"issue_type_l2: expected '{rule['issue_type_l2']}', got '{ticket_l2}'"
+            )
 
         # business_line
         if rule.get("business_line"):

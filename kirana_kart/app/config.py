@@ -201,6 +201,17 @@ class Settings(BaseSettings):
     # created inactive and hold no permissions until an admin approves them.
     signup_enabled: bool = Field(default=False, alias="SIGNUP_ENABLED")
 
+    # ------------------------------------------------------------
+    # POLICY STUDIO GOVERNANCE
+    # ------------------------------------------------------------
+    # Separation of duties: the person who submits a policy change for
+    # approval may not also approve (and thereby activate) it. Disable only
+    # for a deployment with a single policy owner; self-approvals are still
+    # recorded in the audit trail as such.
+    policy_require_separate_approver: bool = Field(
+        default=True, alias="POLICY_REQUIRE_SEPARATE_APPROVER",
+    )
+
     # Optional comma-separated email-domain allowlist applied to both password
     # signup and OAuth account creation (e.g. "kiranakart.com,example.org").
     # Empty means no domain restriction.

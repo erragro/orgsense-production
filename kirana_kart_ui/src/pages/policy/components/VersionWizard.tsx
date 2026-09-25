@@ -6,8 +6,11 @@
  * Step 3 — Taxonomy Review (accept / edit / reject each issue node)
  * Step 4 — Action Review (accept / edit / reject each extracted action)
  * Step 5 — Rules Review (deterministically generated rules, inline editing)
- * Step 6 — Preview (simple simulation)
- * Step 7 — Publish
+ * Step 6 — Preview (sample decision comparison — the server records it as a gate)
+ * Step 7 — Request approval (another policy administrator approves and activates)
+ *
+ * The server advances the proposal's stage as each step's work completes, so
+ * a proposal can be closed and resumed (resumeEntityId) at any point.
  */
 
 import { useState, useRef, useCallback, useEffect } from 'react'
@@ -21,16 +24,22 @@ import {
 import { cn } from '@/lib/cn'
 import { useAuthStore } from '@/stores/auth.store'
 import { hasPermission } from '@/lib/access'
+import { apiErrorMessage } from '@/lib/api-error'
 import { governanceClient as apiClient } from '@/api/clients'
+import { ruleApi } from '@/api/governance/rule-editor.api'
 import {
   bpmApi,
   type TaxonomyProposal,
   type ActionProposal,
   type ReviewProposalPayload,
+  type SimulationGateResult,
+  type SkippedPairing,
 } from '@/api/governance/bpm.api'
 
 interface Props {
   kbId: string
+  /** Continue an existing proposal instead of uploading a new SOP. */
+  resumeEntityId?: string
   onClose: () => void
   onCreated: () => void
 }
@@ -61,6 +70,7 @@ const fetchRules = (kbId: string, version: string) =>
     rule_id: string
     issue_type_l1: string
     issue_type_l2: string | null
+    action_id: number
     action_name: string
     priority: number
     conditions: Record<string, unknown>
@@ -69,8 +79,6 @@ const fetchRules = (kbId: string, version: string) =>
     deterministic: boolean
   }>>(`/rules/${kbId}`, { params: { version } })
 
-const publishVersion = (kbId: string, entityId: string) =>
-  apiClient.post(`/bpm/kb/${kbId}/publish`, { entity_id: entityId })
 
 // ============================================================
 // Step indicator
@@ -115,7 +123,7 @@ function UploadStep({
   const uploadMutation = useMutation({
     mutationFn: (f: File) => uploadDocument(kbId, f, brief),
     onSuccess: (res) => onNext(res.data.entity_id, res.data.filename),
-    onError: (e: Error) => setError(e.message ?? 'Upload failed. Please try again.'),
+    onError: (e: unknown) => setError(apiErrorMessage(e, 'Upload failed. Please try again.')),
   })
 
   const handleFile = useCallback((f: File) => { setError(''); setFile(f) }, [])
@@ -236,13 +244,17 @@ function AIAnalysisStep({
   const [status, setStatus] = useState<AnalysisStatus>('idle')
   const [findings, setFindings] = useState<string[]>([])
   const [error, setError] = useState('')
+  const [truncation, setTruncation] = useState('')
 
   const extractMut = useMutation({
     mutationFn: () => bpmApi.extractTaxonomy(kbId, entityId),
     onMutate: () => { setStatus('running'); setFindings([]) },
     onSuccess: (res) => {
       setStatus('done')
-      const proposals: TaxonomyProposal[] = (res.data as { proposals?: TaxonomyProposal[] }).proposals ?? []
+      const proposals: TaxonomyProposal[] = res.data.proposals ?? []
+      setTruncation(res.data.truncated
+        ? `Only the first ${res.data.analysed_characters.toLocaleString()} of ${res.data.document_characters.toLocaleString()} characters were analysed. Check that the rest of your SOP is covered, or split it into separate proposals.`
+        : '')
       const newCount = proposals.filter((p) => p.proposal_type === 'new').length
       const existingCount = proposals.filter((p) => p.proposal_type === 'existing').length
       setFindings([
@@ -251,10 +263,9 @@ function AIAnalysisStep({
         existingCount > 0 ? `${existingCount} matched to existing taxonomy` : '',
         'Ready for your review',
       ].filter(Boolean))
-      onNext(proposals.length)
     },
-    onError: (e: Error) => {
-      setStatus('error'); setError(e.message ?? 'Analysis failed. Please try again.')
+    onError: (e: unknown) => {
+      setStatus('error'); setError(apiErrorMessage(e, 'Analysis failed. Please try again.'))
     },
   })
 
@@ -301,6 +312,13 @@ function AIAnalysisStep({
             {error}
           </div>
         )}
+
+        {truncation && (
+          <div role="status" className="flex items-start gap-2 text-sm text-amber-800 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-700 rounded-lg p-3 mt-3">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+            {truncation}
+          </div>
+        )}
       </div>
 
       <div className="flex justify-between">
@@ -325,7 +343,7 @@ function AIAnalysisStep({
           </button>
         ) : (
           <button
-            onClick={() => onNext(0)}
+            onClick={() => onNext(findings.length)}
             className="flex items-center gap-2 px-5 py-2.5 bg-brand-600 text-white rounded-lg text-sm font-medium hover:bg-brand-700 transition-colors"
           >
             Review customer problems <ArrowRight className="w-4 h-4" />
@@ -374,6 +392,8 @@ function TaxonomyProposalRow({
       bpmApi.reviewTaxonomyProposal(kbId, proposal.id, payload),
     onSuccess: () => { setEditing(false); onUpdated() },
   })
+  const reviewError = reviewMut.isError ? apiErrorMessage(reviewMut.error, 'Could not save this review.') : ''
+
 
   const accept = () => reviewMut.mutate({ status: 'accepted' })
   const reject = () => reviewMut.mutate({ status: 'rejected' })
@@ -437,6 +457,7 @@ function TaxonomyProposalRow({
             {proposal.description && (
               <p className="text-xs text-foreground/70 mt-0.5 truncate">{proposal.description}</p>
             )}
+            {reviewError && <p role="alert" className="text-xs text-red-600 mt-1">{reviewError}</p>}
           </div>
           <div className="flex items-center gap-1 shrink-0">
             {proposal.status !== 'rejected' && proposal.status !== 'accepted' && proposal.status !== 'edited' && (
@@ -515,10 +536,12 @@ function TaxonomyReviewStep({
       }
     },
     onSuccess: refresh,
+    onError: refresh,
   })
 
   return (
     <div className="space-y-4">
+      {acceptAll.isError && <p role="alert" className="text-sm text-red-600">{apiErrorMessage(acceptAll.error, 'Some items could not be accepted.')}</p>}
       <div className="flex items-start justify-between gap-4">
         <div>
           <h2 className="text-lg font-semibold text-foreground">Which customer problems does this cover?</h2>
@@ -611,6 +634,8 @@ function ActionProposalCard({
       bpmApi.reviewActionProposal(kbId, action.id, payload),
     onSuccess: () => { setEditing(false); onUpdated() },
   })
+  const reviewError = reviewMut.isError ? apiErrorMessage(reviewMut.error, 'Could not save this review.') : ''
+
 
   const accept = () => reviewMut.mutate({ status: 'accepted' })
   const reject = () => reviewMut.mutate({ status: 'rejected' })
@@ -689,6 +714,7 @@ function ActionProposalCard({
                 )}
               </div>
             )}
+            {reviewError && <p role="alert" className="text-xs text-red-600 mt-1">{reviewError}</p>}
             {flags.length > 0 && (
               <div className="flex gap-1 mt-1.5">
                 {flags.map(f => (
@@ -745,11 +771,14 @@ function ActionReviewStep({
   const [extractStatus, setExtractStatus] = useState<ActionExtractStatus>('idle')
   const [extractError, setExtractError] = useState('')
 
-  const { data: actions = [], isLoading } = useQuery({
+  const { data: actions = [], isLoading, isSuccess } = useQuery({
     queryKey: qKey,
     queryFn: () => bpmApi.listActionProposals(kbId, entityId).then(r => r.data),
-    enabled: extractStatus === 'done',
   })
+  // Responses already identified for this proposal (e.g. when resuming) are
+  // reviewed in place. Identifying again replaces them and their reviews.
+  const hasActions = isSuccess && actions.length > 0
+  const showList = extractStatus === 'done' || (extractStatus === 'idle' && hasActions)
 
   const refresh = () => qc.invalidateQueries({ queryKey: qKey })
 
@@ -757,7 +786,7 @@ function ActionReviewStep({
     mutationFn: () => bpmApi.extractActions(kbId, entityId),
     onMutate: () => { setExtractStatus('running'); setExtractError('') },
     onSuccess: () => { setExtractStatus('done'); refresh() },
-    onError: (e: Error) => { setExtractStatus('error'); setExtractError(e.message ?? 'Extraction failed.') },
+    onError: (e: unknown) => { setExtractStatus('error'); setExtractError(apiErrorMessage(e, 'Extraction failed.')) },
   })
 
   const acceptAll = useMutation({
@@ -768,6 +797,7 @@ function ActionReviewStep({
       }
     },
     onSuccess: refresh,
+    onError: refresh,
   })
 
   const accepted = (actions as ActionProposal[]).filter(a => a.status === 'accepted' || a.status === 'edited').length
@@ -782,7 +812,7 @@ function ActionReviewStep({
         </p>
       </div>
 
-      {extractStatus === 'idle' && (
+      {extractStatus === 'idle' && !hasActions && (
         <div className="bg-surface-card border border-surface-border rounded-xl p-5 text-center space-y-3">
           <Zap className="w-8 h-8 text-foreground/70 mx-auto" />
           <p className="text-sm text-foreground/70">Find the responses authorized for the customer problems you accepted.</p>
@@ -810,7 +840,8 @@ function ActionReviewStep({
         </div>
       )}
 
-      {extractStatus === 'done' && (
+      {acceptAll.isError && <p role="alert" className="text-sm text-red-600">{apiErrorMessage(acceptAll.error, 'Some items could not be accepted.')}</p>}
+      {showList && (
         <>
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3 text-xs text-foreground/70">
@@ -818,6 +849,14 @@ function ActionReviewStep({
               <span>·</span>
               <span>{pending} pending</span>
             </div>
+            {extractStatus === 'idle' && (
+              <button
+                onClick={() => { if (window.confirm('Identify responses again? This replaces the responses below and your review of them.')) extractMut.mutate() }}
+                className="text-xs underline text-foreground/70"
+              >
+                Identify again
+              </button>
+            )}
             {pending > 0 && (
               <button
                 onClick={() => acceptAll.mutate()}
@@ -876,6 +915,7 @@ type Rule = {
   rule_id: string
   issue_type_l1: string
   issue_type_l2: string | null
+  action_id: number
   action_name: string
   priority: number
   conditions: Record<string, unknown>
@@ -887,19 +927,85 @@ type Rule = {
 type EditDraft = {
   issue_type_l1: string
   issue_type_l2: string
-  action_name: string
+  action_id: number | null
   priority: number
   min_order_value: string
   max_order_value: string
 }
 
+// Rules are evaluated in priority order: the lower number wins.
+const DEFAULT_PRIORITY = 500
+
 const BLANK_DRAFT: EditDraft = {
   issue_type_l1: '',
   issue_type_l2: '',
-  action_name: '',
-  priority: 50,
+  action_id: null,
+  priority: DEFAULT_PRIORITY,
   min_order_value: '',
   max_order_value: '',
+}
+
+const toPayload = (draft: EditDraft) => ({
+  issue_type_l1: draft.issue_type_l1.trim(),
+  issue_type_l2: draft.issue_type_l2.trim() || null,
+  action_id: draft.action_id,
+  priority: draft.priority,
+  min_order_value: draft.min_order_value ? parseFloat(draft.min_order_value) : null,
+  max_order_value: draft.max_order_value ? parseFloat(draft.max_order_value) : null,
+})
+
+function RuleFields({ kbId, draft, setDraft }: {
+  kbId: string
+  draft: EditDraft
+  setDraft: (update: (d: EditDraft) => EditDraft) => void
+}) {
+  const actionCodes = useQuery({
+    queryKey: ['rule-action-codes', kbId],
+    queryFn: () => ruleApi.listActionCodes(kbId).then(r => r.data),
+    staleTime: 60_000,
+  })
+  return (
+    <>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+        <label className="text-xs text-foreground/70 block">Customer problem *
+          <input className={inp + ' mt-0.5'} value={draft.issue_type_l1}
+            onChange={e => setDraft(d => ({ ...d, issue_type_l1: e.target.value }))}
+            placeholder="e.g. FOOD_SAFETY" />
+        </label>
+        <label className="text-xs text-foreground/70 block">More specific situation
+          <input className={inp + ' mt-0.5'} value={draft.issue_type_l2}
+            onChange={e => setDraft(d => ({ ...d, issue_type_l2: e.target.value }))}
+            placeholder="e.g. FOREIGN_OBJECT" />
+        </label>
+      </div>
+      <label className="text-xs text-foreground/70 block">Action to take *
+        <select className={inp + ' mt-0.5'} value={draft.action_id ?? ''}
+          onChange={e => setDraft(d => ({ ...d, action_id: e.target.value ? Number(e.target.value) : null }))}>
+          <option value="">{actionCodes.isLoading ? 'Loading actions…' : 'Choose an action'}</option>
+          {(actionCodes.data ?? []).map(a => (
+            <option key={a.id} value={a.id}>{a.action_name || a.action_code_id} ({a.action_code_id})</option>
+          ))}
+        </select>
+      </label>
+      {actionCodes.isError && <p className="text-xs text-red-500">{apiErrorMessage(actionCodes.error, 'Actions could not be loaded.')}</p>}
+      <div className="grid grid-cols-3 gap-2">
+        <label className="text-xs text-foreground/70 block">Priority (lower wins)
+          <input className={inp + ' mt-0.5'} type="number" min={0} max={999} value={draft.priority}
+            onChange={e => setDraft(d => ({ ...d, priority: (Number.isNaN(Number.parseInt(e.target.value, 10)) ? DEFAULT_PRIORITY : Number.parseInt(e.target.value, 10)) }))} />
+        </label>
+        <label className="text-xs text-foreground/70 block">Min order (₹)
+          <input className={inp + ' mt-0.5'} type="number" min={0} value={draft.min_order_value}
+            onChange={e => setDraft(d => ({ ...d, min_order_value: e.target.value }))}
+            placeholder="Any" />
+        </label>
+        <label className="text-xs text-foreground/70 block">Max order (₹)
+          <input className={inp + ' mt-0.5'} type="number" min={0} value={draft.max_order_value}
+            onChange={e => setDraft(d => ({ ...d, max_order_value: e.target.value }))}
+            placeholder="Any" />
+        </label>
+      </div>
+    </>
+  )
 }
 
 function RuleCard({
@@ -917,75 +1023,29 @@ function RuleCard({
   const [draft, setDraft] = useState<EditDraft>({
     issue_type_l1: rule.issue_type_l1,
     issue_type_l2: rule.issue_type_l2 ?? '',
-    action_name: rule.action_name,
+    action_id: rule.action_id,
     priority: rule.priority,
     min_order_value: rule.min_order_value != null ? String(rule.min_order_value) : '',
     max_order_value: rule.max_order_value != null ? String(rule.max_order_value) : '',
   })
-  const [saveErr, setSaveErr] = useState('')
 
   const saveMut = useMutation({
-    mutationFn: () =>
-      apiClient.put(`/rules/${kbId}/${rule.id}`, {
-        issue_type_l1: draft.issue_type_l1,
-        issue_type_l2: draft.issue_type_l2 || null,
-        action_name: draft.action_name,
-        priority: draft.priority,
-        min_order_value: draft.min_order_value ? parseFloat(draft.min_order_value) : null,
-        max_order_value: draft.max_order_value ? parseFloat(draft.max_order_value) : null,
-      }),
-    onSuccess: () => { setEditing(false); setSaveErr(''); onSaved() },
-    onError: () => setSaveErr('Could not save. Please check the fields and try again.'),
+    mutationFn: () => apiClient.put(`/rules/${kbId}/${rule.id}`, toPayload(draft)),
+    onSuccess: () => { setEditing(false); onSaved() },
   })
 
   const delMut = useMutation({
     mutationFn: () => apiClient.delete(`/rules/${kbId}/${rule.id}`),
     onSuccess: onDeleted,
   })
+  const error = saveMut.isError ? apiErrorMessage(saveMut.error, 'Could not save. Please check the fields and try again.')
+    : delMut.isError ? apiErrorMessage(delMut.error, 'Could not remove this rule.') : ''
 
   if (editing) {
     return (
       <div className="bg-surface-card border border-brand-500/40 rounded-xl p-4 space-y-3">
-        <div className="grid grid-cols-2 gap-2">
-          <div>
-            <label className="text-xs text-foreground/70 mb-0.5 block">Customer problem *</label>
-            <input className={inp} value={draft.issue_type_l1}
-              onChange={e => setDraft(d => ({ ...d, issue_type_l1: e.target.value }))}
-              placeholder="e.g. FOOD_SAFETY" />
-          </div>
-          <div>
-            <label className="text-xs text-foreground/70 mb-0.5 block">More specific situation</label>
-            <input className={inp} value={draft.issue_type_l2}
-              onChange={e => setDraft(d => ({ ...d, issue_type_l2: e.target.value }))}
-              placeholder="e.g. FOREIGN_OBJECT" />
-          </div>
-        </div>
-        <div>
-          <label className="text-xs text-foreground/70 mb-0.5 block">Action to take *</label>
-          <input className={inp} value={draft.action_name}
-            onChange={e => setDraft(d => ({ ...d, action_name: e.target.value }))}
-            placeholder="e.g. Issue full refund + ₹100 compensation" />
-        </div>
-        <div className="grid grid-cols-3 gap-2">
-          <div>
-            <label className="text-xs text-foreground/70 mb-0.5 block">Priority</label>
-            <input className={inp} type="number" min={0} max={999} value={draft.priority}
-              onChange={e => setDraft(d => ({ ...d, priority: (Number.isNaN(Number.parseInt(e.target.value, 10)) ? 50 : Number.parseInt(e.target.value, 10)) }))} />
-          </div>
-          <div>
-            <label className="text-xs text-foreground/70 mb-0.5 block">Min order (₹)</label>
-            <input className={inp} type="number" value={draft.min_order_value}
-              onChange={e => setDraft(d => ({ ...d, min_order_value: e.target.value }))}
-              placeholder="Any" />
-          </div>
-          <div>
-            <label className="text-xs text-foreground/70 mb-0.5 block">Max order (₹)</label>
-            <input className={inp} type="number" value={draft.max_order_value}
-              onChange={e => setDraft(d => ({ ...d, max_order_value: e.target.value }))}
-              placeholder="Any" />
-          </div>
-        </div>
-        {saveErr && <p className="text-xs text-red-500">{saveErr}</p>}
+        <RuleFields kbId={kbId} draft={draft} setDraft={setDraft} />
+        {error && <p role="alert" className="text-xs text-red-500">{error}</p>}
         <div className="flex gap-2 justify-end">
           <button onClick={() => setEditing(false)}
             className="px-3 py-1.5 text-sm border border-surface-border rounded-lg text-foreground hover:bg-surface transition-colors">
@@ -993,7 +1053,7 @@ function RuleCard({
           </button>
           <button
             onClick={() => saveMut.mutate()}
-            disabled={saveMut.isPending || !draft.issue_type_l1 || !draft.action_name}
+            disabled={saveMut.isPending || !draft.issue_type_l1.trim() || !draft.action_id}
             className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-brand-600 text-white rounded-lg hover:bg-brand-700 disabled:opacity-40 transition-colors">
             <Save className="w-3.5 h-3.5" />
             {saveMut.isPending ? 'Saving…' : 'Save Rule'}
@@ -1008,7 +1068,7 @@ function RuleCard({
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-xs font-mono text-foreground/70">{rule.rule_id}</span>
+            <span className="text-xs font-mono text-foreground/70 break-all">{rule.rule_id}</span>
             <span className="text-xs px-2 py-0.5 rounded-full bg-blue-50 dark:bg-blue-900/20 text-blue-600 font-medium">
               {rule.issue_type_l1}{rule.issue_type_l2 ? ` › ${rule.issue_type_l2}` : ''}
             </span>
@@ -1028,6 +1088,7 @@ function RuleCard({
               {rule.max_order_value != null ? `≤ ₹${rule.max_order_value}` : ''}
             </p>
           )}
+          {error && <p role="alert" className="text-xs text-red-500 mt-1">{error}</p>}
         </div>
         <div className="flex items-center gap-1 shrink-0">
           <button onClick={() => setEditing(true)}
@@ -1058,22 +1119,10 @@ function AddRuleCard({
 }) {
   const [open, setOpen] = useState(false)
   const [draft, setDraft] = useState<EditDraft>(BLANK_DRAFT)
-  const [err, setErr] = useState('')
 
   const addMut = useMutation({
-    mutationFn: () =>
-      apiClient.post(`/rules/${kbId}`, {
-        kb_id: kbId,
-        version_label: entityId,
-        issue_type_l1: draft.issue_type_l1,
-        issue_type_l2: draft.issue_type_l2 || null,
-        action_name: draft.action_name,
-        priority: draft.priority,
-        min_order_value: draft.min_order_value ? parseFloat(draft.min_order_value) : null,
-        max_order_value: draft.max_order_value ? parseFloat(draft.max_order_value) : null,
-      }),
-    onSuccess: () => { setOpen(false); setDraft(BLANK_DRAFT); setErr(''); onAdded() },
-    onError: () => setErr('Could not add rule. Please fill in all required fields.'),
+    mutationFn: () => apiClient.post(`/rules/${kbId}`, { policy_version: entityId, ...toPayload(draft) }),
+    onSuccess: () => { setOpen(false); setDraft(BLANK_DRAFT); onAdded() },
   })
 
   if (!open) {
@@ -1090,54 +1139,16 @@ function AddRuleCard({
   return (
     <div className="bg-surface-card border border-brand-500/40 rounded-xl p-4 space-y-3">
       <p className="text-sm font-semibold text-foreground">New Rule</p>
-      <div className="grid grid-cols-2 gap-2">
-        <div>
-          <label className="text-xs text-foreground/70 mb-0.5 block">Customer problem *</label>
-          <input className={inp} value={draft.issue_type_l1}
-            onChange={e => setDraft(d => ({ ...d, issue_type_l1: e.target.value }))}
-            placeholder="e.g. FOOD_SAFETY" />
-        </div>
-        <div>
-          <label className="text-xs text-foreground/70 mb-0.5 block">More specific situation</label>
-          <input className={inp} value={draft.issue_type_l2}
-            onChange={e => setDraft(d => ({ ...d, issue_type_l2: e.target.value }))}
-            placeholder="e.g. FOREIGN_OBJECT" />
-        </div>
-      </div>
-      <div>
-        <label className="text-xs text-foreground/70 mb-0.5 block">Action to take *</label>
-        <input className={inp} value={draft.action_name}
-          onChange={e => setDraft(d => ({ ...d, action_name: e.target.value }))}
-          placeholder="e.g. Issue full refund + ₹100 compensation" />
-      </div>
-      <div className="grid grid-cols-3 gap-2">
-        <div>
-          <label className="text-xs text-foreground/70 mb-0.5 block">Priority</label>
-          <input className={inp} type="number" min={0} max={999} value={draft.priority}
-            onChange={e => setDraft(d => ({ ...d, priority: (Number.isNaN(Number.parseInt(e.target.value, 10)) ? 50 : Number.parseInt(e.target.value, 10)) }))} />
-        </div>
-        <div>
-          <label className="text-xs text-foreground/70 mb-0.5 block">Min order (₹)</label>
-          <input className={inp} type="number" value={draft.min_order_value}
-            onChange={e => setDraft(d => ({ ...d, min_order_value: e.target.value }))}
-            placeholder="Any" />
-        </div>
-        <div>
-          <label className="text-xs text-foreground/70 mb-0.5 block">Max order (₹)</label>
-          <input className={inp} type="number" value={draft.max_order_value}
-            onChange={e => setDraft(d => ({ ...d, max_order_value: e.target.value }))}
-            placeholder="Any" />
-        </div>
-      </div>
-      {err && <p className="text-xs text-red-500">{err}</p>}
+      <RuleFields kbId={kbId} draft={draft} setDraft={setDraft} />
+      {addMut.isError && <p role="alert" className="text-xs text-red-500">{apiErrorMessage(addMut.error, 'Could not add rule. Please fill in all required fields.')}</p>}
       <div className="flex gap-2 justify-end">
-        <button onClick={() => { setOpen(false); setDraft(BLANK_DRAFT); setErr('') }}
+        <button onClick={() => { setOpen(false); setDraft(BLANK_DRAFT); addMut.reset() }}
           className="px-3 py-1.5 text-sm border border-surface-border rounded-lg text-foreground hover:bg-surface transition-colors">
           Cancel
         </button>
         <button
           onClick={() => addMut.mutate()}
-          disabled={addMut.isPending || !draft.issue_type_l1 || !draft.action_name}
+          disabled={addMut.isPending || !draft.issue_type_l1.trim() || !draft.action_id}
           className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-brand-600 text-white rounded-lg hover:bg-brand-700 disabled:opacity-40 transition-colors">
           <Plus className="w-3.5 h-3.5" />
           {addMut.isPending ? 'Adding…' : 'Add Rule'}
@@ -1146,8 +1157,6 @@ function AddRuleCard({
     </div>
   )
 }
-
-type GenStatus = 'idle' | 'running' | 'done' | 'error'
 
 function ReviewRulesStep({
   kbId,
@@ -1162,29 +1171,37 @@ function ReviewRulesStep({
 }) {
   const qc = useQueryClient()
   const qKey = ['rules', kbId, entityId, 'wizard']
-  const [genStatus, setGenStatus] = useState<GenStatus>('idle')
-  const [genError, setGenError] = useState('')
+  const [skipped, setSkipped] = useState<SkippedPairing[]>([])
+  const autoGenerated = useRef(false)
 
-  const { data: rules = [], isLoading } = useQuery({
+  const rulesQuery = useQuery({
     queryKey: qKey,
-    queryFn: () => fetchRules(kbId, entityId).then(r => r.data),
-    enabled: genStatus === 'done',
+    queryFn: () => fetchRules(kbId, entityId).then(r => r.data as unknown as Rule[]),
   })
+  const rules = rulesQuery.data ?? []
 
   const refresh = () => qc.invalidateQueries({ queryKey: qKey })
 
   const generateMut = useMutation({
     mutationFn: () => bpmApi.generateRules(kbId, entityId),
-    onMutate: () => { setGenStatus('running'); setGenError('') },
-    onSuccess: () => { setGenStatus('done'); refresh() },
-    onError: (e: Error) => { setGenStatus('error'); setGenError(e.message ?? 'Generation failed.') },
+    onSuccess: (res) => { setSkipped(res.data.skipped ?? []); refresh() },
   })
 
-  // Auto-generate on mount
+  // Generate once for a proposal with no decisions yet. Regenerating replaces
+  // manual changes, so it never happens implicitly when decisions exist.
   useEffect(() => {
-    generateMut.mutate()
+    if (rulesQuery.isSuccess && rules.length === 0 && !autoGenerated.current) {
+      autoGenerated.current = true
+      generateMut.mutate()
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [rulesQuery.isSuccess, rules.length])
+
+  const regenerate = () => {
+    if (window.confirm('Regenerate decisions from the reviewed problems and responses? Manual changes to the decisions below will be replaced.')) {
+      generateMut.mutate()
+    }
+  }
 
   return (
     <div className="space-y-5">
@@ -1195,50 +1212,60 @@ function ReviewRulesStep({
         </p>
       </div>
 
-      {genStatus === 'running' && (
+      {generateMut.isPending && (
         <div className="flex items-center justify-center gap-2 py-6 text-sm text-foreground/70">
           <Loader2 className="w-5 h-5 animate-spin text-brand-500" />
           Connecting customer problems to their proposed responses...
         </div>
       )}
 
-      {genStatus === 'error' && (
-        <div className="flex items-center gap-2 text-sm text-red-600 bg-red-50 dark:bg-red-900/10 border border-red-200 rounded-lg p-3">
+      {generateMut.isError && (
+        <div role="alert" className="flex items-center gap-2 text-sm text-red-600 bg-red-50 dark:bg-red-900/10 border border-red-200 rounded-lg p-3">
           <AlertTriangle className="w-4 h-4 shrink-0" />
-          {genError}
+          {apiErrorMessage(generateMut.error, 'Generation failed.')}
           <button onClick={() => generateMut.mutate()} className="ml-auto underline text-xs">Retry</button>
         </div>
       )}
 
-      {genStatus === 'done' && (
-        <>
-          {isLoading ? (
-            <div className="flex justify-center py-10">
-              <Loader2 className="w-6 h-6 animate-spin text-brand-500" />
-            </div>
-          ) : rules.length === 0 ? (
-            <div className="text-center py-6 text-sm text-foreground/70">
-              No rules generated. Add rules manually below.
-            </div>
-          ) : (
-            <div className="space-y-2 max-h-[380px] overflow-y-auto pr-1">
-              {(rules as Rule[]).map((rule) => (
-                <RuleCard
-                  key={rule.id}
-                  rule={rule}
-                  kbId={kbId}
-                  onSaved={refresh}
-                  onDeleted={refresh}
-                />
-              ))}
-            </div>
-          )}
-          {rules.length > 0 && (
-            <p className="text-xs text-foreground/70 text-center">
-              {rules.length} rule{rules.length !== 1 ? 's' : ''}
-            </p>
-          )}
-        </>
+      {skipped.length > 0 && (
+        <div role="status" className="text-sm text-amber-800 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-700 rounded-lg p-3 space-y-1">
+          <p className="font-medium">{skipped.length} accepted pairing{skipped.length !== 1 ? 's' : ''} could not become a decision</p>
+          {skipped.slice(0, 5).map(s => (
+            <p key={`${s.issue_code}-${s.action_code_id}`} className="text-xs">{s.action_code_id} for {s.issue_code}: {s.reason}</p>
+          ))}
+        </div>
+      )}
+
+      {rulesQuery.isLoading ? (
+        <div className="flex justify-center py-10">
+          <Loader2 className="w-6 h-6 animate-spin text-brand-500" />
+        </div>
+      ) : rulesQuery.isError ? (
+        <p role="alert" className="text-sm text-red-600">{apiErrorMessage(rulesQuery.error, 'Decisions could not be loaded.')}</p>
+      ) : rules.length === 0 && !generateMut.isPending ? (
+        <div className="text-center py-6 text-sm text-foreground/70">
+          No rules generated. Add rules manually below.
+        </div>
+      ) : (
+        <div className="space-y-2 max-h-[380px] overflow-y-auto pr-1">
+          {rules.map((rule) => (
+            <RuleCard
+              key={rule.id}
+              rule={rule}
+              kbId={kbId}
+              onSaved={refresh}
+              onDeleted={refresh}
+            />
+          ))}
+        </div>
+      )}
+      {rules.length > 0 && (
+        <div className="flex items-center justify-between text-xs text-foreground/70">
+          <span>{rules.length} rule{rules.length !== 1 ? 's' : ''}</span>
+          <button onClick={regenerate} disabled={generateMut.isPending} className="underline disabled:opacity-40">
+            Regenerate from reviewed proposals
+          </button>
+        </div>
       )}
 
       <AddRuleCard kbId={kbId} entityId={entityId} onAdded={refresh} />
@@ -1252,7 +1279,7 @@ function ReviewRulesStep({
         </button>
         <button
           onClick={onNext}
-          disabled={genStatus !== 'done' || (rules as Rule[]).length === 0}
+          disabled={generateMut.isPending || rules.length === 0}
           className="flex items-center gap-2 px-5 py-2.5 bg-brand-600 text-white rounded-lg text-sm font-medium hover:bg-brand-700 disabled:opacity-40 transition-colors"
         >
           Compare sample decisions <ArrowRight className="w-4 h-4" />
@@ -1263,28 +1290,10 @@ function ReviewRulesStep({
 }
 
 // ============================================================
-// Step 6 — Preview (simple)
+// Step 6 — Preview (sample decision comparison)
 // ============================================================
 
-type SimStatus = 'idle' | 'running' | 'passed' | 'failed' | 'unavailable' | 'error'
-
-interface SimResponse {
-  status: 'ok' | 'unavailable'
-  passed: boolean | null
-  reason?: string
-  metrics: {
-    unchanged_rate: number
-    changed_count: number
-    ticket_count: number
-    rule_count: number
-    baseline_version: string
-    candidate_version: string
-    threshold: number
-    sample_source?: string
-    measurement_scope?: string
-    examples?: Array<{ ticket_id: string | number; baseline: string; candidate: string }>
-  } | null
-}
+type SimStatus = 'idle' | 'running' | 'passed' | 'failed' | 'not_applicable' | 'unavailable' | 'error'
 
 function PreviewStep({
   kbId,
@@ -1297,50 +1306,57 @@ function PreviewStep({
   entityId: string
   onNext: () => void
   onBack: () => void
-  onResult: (result: SimResponse | null) => void
+  onResult: (result: SimulationGateResult | null) => void
 }) {
   const [simStatus, setSimStatus] = useState<SimStatus>('idle')
   const [metrics, setMetrics] = useState<Record<string, string> | null>(null)
   const [notice, setNotice] = useState('')
 
   const runSimMutation = useMutation({
-    mutationFn: () =>
-      apiClient.post<SimResponse>(`/bpm/kb/${kbId}/simulate`, { entity_id: entityId }),
+    mutationFn: () => bpmApi.simulate(kbId, entityId),
     onMutate: () => { onResult(null); setSimStatus('running'); setNotice(''); setMetrics(null) },
     onSuccess: (res) => {
-      onResult(res.data)
       const { status, passed, reason, metrics: m } = res.data
 
-      // The gate reports honestly when it cannot run. Previously this branch
-      // fell back to a hardcoded 0.94, so the reviewer was shown a confident
+      // The gate reports honestly when it cannot run. It previously fell
+      // back to a hardcoded 0.94, so the reviewer was shown a confident
       // "94.0% unchanged" for a simulation that never happened.
-      if (status !== 'ok' || !m) {
+      if (status === 'unavailable' || !m) {
         setSimStatus('unavailable')
         setNotice(reason || 'The preview could not be run for this version.')
+        return
+      }
+      onResult(res.data)
+      if (status === 'not_applicable') {
+        setSimStatus('not_applicable')
+        setNotice(reason || 'No policy is live yet, so there is nothing to compare against.')
         return
       }
 
       setSimStatus(passed ? 'passed' : 'failed')
       setMetrics({
-        'Decisions unchanged': `${(m.unchanged_rate * 100).toFixed(1)}%`,
-        'Decisions different': `${((1 - m.unchanged_rate) * 100).toFixed(1)}%`,
+        'Decisions unchanged': `${((m.unchanged_rate ?? 0) * 100).toFixed(1)}%`,
+        'Decisions different': `${((1 - (m.unchanged_rate ?? 0)) * 100).toFixed(1)}%`,
         'Tickets tested': String(m.ticket_count),
         'Decisions changed': String(m.changed_count),
-        'Compared against': m.baseline_version,
+        'Compared against': m.baseline_version ?? '',
       })
     },
-    onError: () => {
+    onError: (e: unknown) => {
       setSimStatus('error')
-      setNotice('The comparison could not be completed. Try again or ask your support team for help.')
+      setNotice(apiErrorMessage(e, 'The comparison could not be completed. Try again or ask your support team for help.'))
     },
   })
+
+  const examples = runSimMutation.data?.data.examples ?? []
+  const recorded = simStatus === 'passed' || simStatus === 'failed' || simStatus === 'not_applicable'
 
   return (
     <div className="space-y-6">
       <div>
         <h2 className="text-lg font-semibold text-foreground">What would change?</h2>
         <p className="text-sm text-foreground/70 mt-1">
-          Compare the current and proposed policies on saved sample cases. This replay does not change customer decisions.
+          Compare the current and proposed policies on saved sample cases. This replay does not change customer decisions. The result is recorded with the proposal for its approver.
         </p>
       </div>
 
@@ -1348,11 +1364,9 @@ function PreviewStep({
         'rounded-xl border p-5',
         simStatus === 'passed'
           ? 'border-green-200 dark:border-green-700 bg-green-50 dark:bg-green-900/10'
-          : simStatus === 'failed'
+          : simStatus === 'failed' || simStatus === 'unavailable' || simStatus === 'error'
             ? 'border-amber-200 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/10'
-            : simStatus === 'unavailable' || simStatus === 'error'
-              ? 'border-amber-200 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/10'
-              : 'border-surface-border bg-surface-card',
+            : 'border-surface-border bg-surface-card',
       )}>
         <div className="flex items-center gap-3 mb-4">
           <BarChart2 className="w-5 h-5 text-foreground/70 shrink-0" />
@@ -1362,6 +1376,9 @@ function PreviewStep({
           )}
           {simStatus === 'failed' && (
             <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-600 font-medium">Larger change: review the differences</span>
+          )}
+          {simStatus === 'not_applicable' && (
+            <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-surface text-foreground/70 border border-surface-border font-medium">First live version</span>
           )}
           {(simStatus === 'unavailable' || simStatus === 'error') && (
             <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-500 font-medium">Not available</span>
@@ -1385,23 +1402,25 @@ function PreviewStep({
             <div className="space-y-1">
               <p className="text-sm text-foreground">{notice}</p>
               <p className="text-xs text-foreground/70">
-                No impact figures are available for this version. Review the
-                generated rules yourself before publishing.
+                No impact figures are available, and approval cannot be requested until the comparison runs.
               </p>
             </div>
           </div>
         )}
+        {simStatus === 'not_applicable' && (
+          <p className="text-sm text-foreground">{notice} No decision impact is measured; the approver reviews the decisions themselves.</p>
+        )}
         {metrics && (simStatus === 'passed' || simStatus === 'failed') && (
           <div className="space-y-2">
             {Object.entries(metrics).map(([k, v]) => (
-              <div key={k} className="flex justify-between text-sm">
+              <div key={k} className="flex justify-between gap-4 text-sm">
                 <span className="text-foreground/70">{k}</span>
-                <span className="text-foreground font-medium font-mono">{v}</span>
+                <span className="text-foreground font-medium font-mono text-right break-all">{v}</span>
               </div>
             ))}
             {simStatus === 'failed' && (
               <p className="text-xs text-amber-600 mt-3 pt-2 border-t border-amber-200 dark:border-amber-700">
-                The change rate exceeds the configured threshold. This is not a verdict on quality: check whether the differences match your intended outcome.
+                The change rate exceeds the configured threshold. This is not a verdict on quality: revise the decisions, or explain why the change is intended when requesting approval.
               </p>
             )}
           </div>
@@ -1411,12 +1430,13 @@ function PreviewStep({
       <div className="rounded-xl border border-surface-border p-4 text-sm space-y-2">
         <p className="font-medium">What this test tells you</p>
         <p className="text-foreground/70">Up to 1,000 saved simulation cases; no date range or representative sampling is established. The comparison measures final actions, not refund amounts, savings, or customer satisfaction.</p>
+        <p className="text-foreground/70">It applies each version's rules in priority order, as the live system ranks them. The live system also uses AI judgement on each ticket, so real decisions can differ from this replay.</p>
         <p className="text-foreground/70">A different decision can be an improvement. Review whether it follows the proposed SOP before making a launch decision.</p>
       </div>
-      {runSimMutation.data?.data.metrics?.examples?.length ? <div className="overflow-x-auto">
+      {examples.length ? <div className="overflow-x-auto">
         <h3 className="text-sm font-semibold mb-2">Examples to review</h3>
         <table className="w-full text-sm text-left"><thead><tr><th className="p-2">Case</th><th className="p-2">Current decision</th><th className="p-2">Proposed decision</th></tr></thead>
-          <tbody>{runSimMutation.data.data.metrics.examples.map((example, index) => <tr className="border-t border-surface-border" key={index}><td className="p-2">{example.ticket_id}</td><td className="p-2">{example.baseline}</td><td className="p-2">{example.candidate}</td></tr>)}</tbody></table>
+          <tbody>{examples.map((example, index) => <tr className="border-t border-surface-border" key={index}><td className="p-2">{example.ticket_id}</td><td className="p-2">{example.baseline}</td><td className="p-2">{example.candidate}</td></tr>)}</tbody></table>
       </div> : null}
 
       <div className="flex justify-between">
@@ -1427,7 +1447,7 @@ function PreviewStep({
           <ArrowLeft className="w-4 h-4" /> Back
         </button>
         <div className="flex gap-2">
-          {simStatus !== 'running' && simStatus !== 'passed' && (
+          {simStatus !== 'running' && simStatus !== 'passed' && simStatus !== 'not_applicable' && (
             <button
               onClick={() => runSimMutation.mutate()}
               disabled={runSimMutation.isPending}
@@ -1440,28 +1460,22 @@ function PreviewStep({
               )}
             </button>
           )}
-          {simStatus !== 'idle' && simStatus !== 'running' && (
+          {simStatus !== 'running' && (
             <button
               onClick={onNext}
               className={cn(
                 'flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium transition-colors',
-                simStatus === 'passed'
+                simStatus === 'passed' || simStatus === 'not_applicable'
                   ? 'bg-brand-600 text-white hover:bg-brand-700'
                   : 'border border-surface-border text-foreground hover:bg-surface',
               )}
             >
-              {simStatus === 'passed'
-                ? <>Review launch decision <ArrowRight className="w-4 h-4" /></>
-                : <>Review evidence gaps <ArrowRight className="w-4 h-4" /></>
+              {recorded && simStatus !== 'failed'
+                ? <>Request approval <ArrowRight className="w-4 h-4" /></>
+                : simStatus === 'failed'
+                  ? <>Review evidence gaps <ArrowRight className="w-4 h-4" /></>
+                  : <>Continue without a test <ArrowRight className="w-4 h-4" /></>
               }
-            </button>
-          )}
-          {simStatus === 'idle' && (
-            <button
-              onClick={onNext}
-              className="flex items-center gap-2 px-4 py-2 text-sm border border-surface-border rounded-lg text-foreground hover:bg-surface transition-colors"
-            >
-              Review without a test <ArrowRight className="w-4 h-4" />
             </button>
           )}
         </div>
@@ -1471,59 +1485,78 @@ function PreviewStep({
 }
 
 // ============================================================
-// Step 7 — Publish
+// Step 7 — Request approval
 // ============================================================
 
-function PublishStep({ kbId, entityId, evidence, onCreated, onBack }: {
-  kbId: string; entityId: string; evidence: SimResponse | null; onCreated: () => void; onBack: () => void
+const MIN_JUSTIFICATION = 20
+
+function SubmitStep({ kbId, entityId, evidence, onCreated, onBack }: {
+  kbId: string; entityId: string; evidence: SimulationGateResult | null; onCreated: () => void; onBack: () => void
 }) {
   const qc = useQueryClient()
   const { user } = useAuthStore()
-  const canPublish = hasPermission(user, 'policy', 'admin') || !!user?.is_super_admin
-  const [acknowledged, setAcknowledged] = useState(false)
+  const canApprove = hasPermission(user, 'policy', 'admin') || !!user?.is_super_admin
+  const [justification, setJustification] = useState('')
   const rules = useQuery({ queryKey: ['rules', kbId, entityId, 'wizard'], queryFn: () => fetchRules(kbId, entityId).then(r => r.data) })
-  const categories = useQuery({ queryKey: ['launch-categories', kbId, entityId], queryFn: () => bpmApi.listTaxonomyProposals(kbId, entityId).then(r => r.data) })
-  const actions = useQuery({ queryKey: ['launch-actions', kbId, entityId], queryFn: () => bpmApi.listActionProposals(kbId, entityId).then(r => r.data) })
   const instances = useQuery({ queryKey: ['bpm', 'instances', kbId, entityId, 'wizard'], queryFn: () => bpmApi.listInstances(kbId, { entity_id: entityId, limit: 1 }).then(r => r.data), refetchInterval: 15_000 })
+  const readiness = useQuery({ queryKey: ['bpm', 'readiness', kbId, entityId], queryFn: () => bpmApi.getReadiness(kbId, entityId).then(r => r.data), refetchInterval: 15_000 })
   const instance = instances.data?.find(i => i.entity_id === entityId)
   const brief = instance?.metadata?.business_brief as Partial<BusinessBrief> | undefined
-  const pending = [...(categories.data ?? []), ...(actions.data ?? [])].filter(p => p.status === 'pending').length
-  const loaded = rules.isSuccess && categories.isSuccess && actions.isSuccess && instances.isSuccess
-  const hasReview = (categories.data ?? []).some(p => ['accepted', 'edited'].includes(p.status)) && (actions.data ?? []).some(p => ['accepted', 'edited'].includes(p.status))
-  const ready = loaded && hasReview && pending === 0 && !!rules.data?.length && instance?.current_stage === 'PENDING_APPROVAL'
+  const review = readiness.data?.review
+  const stage = readiness.data?.stage ?? instance?.current_stage
+  const pending = review ? review.taxonomy_pending + review.actions_pending : 0
+  const loaded = rules.isSuccess && instances.isSuccess && readiness.isSuccess
+  const needsJustification = stage === 'SIMULATION_FAILED'
+  const submitted = stage === 'PENDING_APPROVAL'
   const blockers = !loaded ? ['Review evidence could not be loaded yet. Try again before deciding.'] : [
-    ...(!hasReview ? ['Accept at least one customer problem and one proposed response.'] : []),
     ...(pending > 0 ? [`Resolve the ${pending} items still awaiting your review.`] : []),
-    ...(!rules.data?.length ? ['Add and review at least one decision.'] : []),
-    ...(instance?.current_stage !== 'PENDING_APPROVAL' ? ['This proposal has not reached its launch approval stage. Complete that review in Policy Studio before activation.'] : []),
+    ...(!review?.rules ? ['Add and review at least one decision.'] : []),
+    ...(!submitted && stage !== 'SHADOW_GATE' && stage !== 'SIMULATION_FAILED'
+      ? ['Run the sample decision comparison (previous step) before requesting approval.'] : []),
   ]
-  const summary = evidence?.status === 'ok' && evidence.metrics
-    ? `${evidence.metrics.changed_count} of ${evidence.metrics.ticket_count} sample cases receive a different final action. ${evidence.passed ? 'Within' : 'Outside'} the configured change threshold.`
-    : 'No completed sample comparison is available in this review. Impact has not been established.'
-  const mutation = useMutation({ mutationFn: () => publishVersion(kbId, entityId), onSuccess: () => { qc.invalidateQueries({ queryKey: ['bpm', 'instances', kbId] }); onCreated() } })
+  const ready = loaded && !submitted && blockers.length === 0 &&
+    (!needsJustification || justification.trim().length >= MIN_JUSTIFICATION)
+  const m = evidence?.metrics
+  const summary = evidence?.status === 'ok' && m
+    ? `${m.changed_count} of ${m.ticket_count} sample cases receive a different final action. ${evidence.passed ? 'Within' : 'Outside'} the configured change threshold.`
+    : evidence?.status === 'not_applicable'
+      ? 'No policy is live yet, so no existing decision changes. Impact on new tickets has not been measured.'
+      : 'No sample comparison was run in this session. The recorded result is shown to the approver in the proposal’s Gates tab.'
+  const mutation = useMutation({
+    mutationFn: () => bpmApi.submitForApproval(kbId, entityId, needsJustification ? justification.trim() : undefined),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['bpm', 'instances', kbId] })
+      readiness.refetch(); instances.refetch()
+    },
+  })
   const downloadBrief = () => {
-    const text = [`# ${brief?.name || 'Policy change'}\n`, `Version: ${entityId}`, `Owner: ${instance?.created_by_name || 'Not available'}`, `Intended outcome: ${brief?.outcome || 'Not supplied'}`, `Intended scope: ${brief?.scope || 'Not supplied; review conditions'}`, '', '## Evidence', summary, `Rules: ${rules.data?.length ?? 'Not available'}; pending review items: ${loaded ? pending : 'Not available'}`, 'Live comparison: not verified by this wizard. No customer-outcome or financial benefit has been established.', '', '## Decision', 'This brief is for review. It is not an approval or proof of activation.'].join('\n')
+    const text = [`# ${brief?.name || 'Policy change'}\n`, `Version: ${entityId}`, `Owner: ${instance?.created_by_name || 'Not available'}`, `Intended outcome: ${brief?.outcome || 'Not supplied'}`, `Intended scope: ${brief?.scope || 'Not supplied; review conditions'}`, '', '## Evidence', summary, `Rules: ${review?.rules ?? 'Not available'}; pending review items: ${loaded ? pending : 'Not available'}`, ...(needsJustification && justification.trim() ? [`Justification for the larger change: ${justification.trim()}`] : []), 'Live comparison: not verified by this wizard. No customer-outcome or financial benefit has been established.', '', '## Decision', 'This brief is for review. It is not an approval or proof of activation.'].join('\n')
     const url = URL.createObjectURL(new Blob([text], { type: 'text/markdown;charset=utf-8' }))
     const link = document.createElement('a'); link.href = url; link.download = 'policy-change-brief.md'; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
   return <div className="space-y-5">
-    <div><p className="text-xs uppercase tracking-widest text-brand-600 mb-2">Business review</p><h2 className="text-xl font-semibold">Make an informed launch decision</h2><p className="text-sm text-foreground/70 mt-2">Review the proposal, the evidence, and the gaps. Sharing this brief does not change the policy serving customers.</p></div>
+    <div><p className="text-xs uppercase tracking-widest text-brand-600 mb-2">Business review</p><h2 className="text-xl font-semibold">Request a launch decision</h2><p className="text-sm text-foreground/70 mt-2">Review the proposal, the evidence and the gaps, then ask another policy administrator to approve it. Nothing changes for customers until they approve.</p></div>
     <section className="rounded-xl border border-surface-border p-5 space-y-3">
       <h3 className="font-semibold">{brief?.name || 'Proposed policy change'}</h3>
       <dl className="space-y-3 text-sm"><div><dt className="text-foreground/70">Intended business outcome</dt><dd>{brief?.outcome || 'No outcome was supplied with this version.'}</dd></div><div><dt className="text-foreground/70">Intended scope</dt><dd>{brief?.scope || 'Confirm which customers and situations the decision conditions cover.'}</dd></div><div><dt className="text-foreground/70">Proposal owner</dt><dd>{instance?.created_by_name || 'Not available'}</dd></div></dl>
     </section>
     <section className="rounded-xl border border-surface-border p-5 space-y-3 text-sm">
       <h3 className="font-semibold">Evidence, not assumptions</h3>
-      <p>{loaded ? `${rules.data?.length ?? 0} proposed decisions · ${pending} review items still open` : 'Review evidence is loading or unavailable. Activation remains disabled.'}</p>
+      <p>{loaded ? `${review?.rules ?? 0} proposed decision${review?.rules === 1 ? '' : 's'} · ${pending} review item${pending === 1 ? '' : 's'} still open` : 'Review evidence is loading or unavailable.'}</p>
       <p>{summary}</p>
       <p className="text-foreground/70">Live comparison has not been verified by this wizard. A workflow stage alone does not prove cases were evaluated.</p>
       <p className="text-foreground/70">Savings, refund cost and customer satisfaction are not measured by this sample test.</p>
     </section>
-    {!ready && <p role="status" className="rounded-lg border border-amber-300 bg-amber-50 dark:bg-amber-900/10 p-4 text-sm text-amber-800 dark:text-amber-300"><strong className="block mb-2">Before this can go live</strong>{blockers.map(reason => <span key={reason} className="block mb-1">{reason}</span>)}<span className="block mt-2">Keep the proposal or download its brief to continue the review.</span></p>}
-    {ready && <label className="flex items-start gap-3 text-sm"><input className="mt-1" type="checkbox" checked={acknowledged} onChange={e => setAcknowledged(e.target.checked)} /><span>I have reviewed the evidence and its limitations, and am authorized to replace the current policy for new tickets.</span></label>}
-    {mutation.isError && <p role="alert" className="text-sm text-red-600">Activation did not complete. Check the policy status before retrying, or ask your support team for help.</p>}
-    <div className="flex flex-wrap gap-2 justify-between"><button className="text-sm underline" onClick={onBack}>Back to impact test</button><div className="flex flex-wrap gap-2"><button className="px-3 py-2 border border-surface-border rounded-lg text-sm" onClick={downloadBrief} disabled={!loaded}>Download review brief</button><button className="px-3 py-2 border border-surface-border rounded-lg text-sm" onClick={onCreated}>Keep proposal & close</button>{canPublish && <button className="px-4 py-2 rounded-lg bg-brand-600 text-white text-sm disabled:opacity-40" onClick={() => mutation.mutate()} disabled={!ready || !acknowledged || mutation.isPending}>{mutation.isPending ? 'Activating…' : 'Activate for new tickets'}</button>}</div></div>
-    {!canPublish && <p className="text-xs text-foreground/70">A policy publisher must authorize activation. You can prepare and share the review brief.</p>}
+    {submitted && <p role="status" className="rounded-lg border border-green-300 bg-green-50 dark:bg-green-900/10 p-4 text-sm text-green-800 dark:text-green-300">
+      Submitted for approval. Runtime preparation: {readiness.data?.preparation_status ?? 'not started'}. {canApprove ? 'Another policy administrator approves and activates it from the proposal on the Policy Studio board.' : 'A policy administrator approves and activates it from the Policy Studio board.'}
+    </p>}
+    {!submitted && blockers.length > 0 && <p role="status" className="rounded-lg border border-amber-300 bg-amber-50 dark:bg-amber-900/10 p-4 text-sm text-amber-800 dark:text-amber-300"><strong className="block mb-2">Before approval can be requested</strong>{blockers.map(reason => <span key={reason} className="block mb-1">{reason}</span>)}<span className="block mt-2">Keep the proposal or download its brief to continue the review.</span></p>}
+    {!submitted && needsJustification && blockers.length === 0 && <label className="block text-sm font-medium">Why is this larger change intended?
+      <textarea className={inp + ' mt-1'} rows={3} maxLength={2000} value={justification} onChange={e => setJustification(e.target.value)} placeholder="e.g. Replacements are now the promised remedy for missing items, so most refund decisions are expected to change." />
+      <span className="block text-xs text-foreground/70 font-normal mt-1">Recorded with the approval request. At least {MIN_JUSTIFICATION} characters.</span>
+    </label>}
+    {mutation.isError && <p role="alert" className="text-sm text-red-600">{apiErrorMessage(mutation.error, 'The approval request could not be created. Nothing was changed.')}</p>}
+    <div className="flex flex-wrap gap-2 justify-between"><button className="text-sm underline" onClick={onBack}>Back to impact test</button><div className="flex flex-wrap gap-2"><button className="px-3 py-2 border border-surface-border rounded-lg text-sm" onClick={downloadBrief} disabled={!loaded}>Download review brief</button><button className="px-3 py-2 border border-surface-border rounded-lg text-sm" onClick={onCreated}>{submitted ? 'Close' : 'Keep proposal & close'}</button>{!submitted && <button className="px-4 py-2 rounded-lg bg-brand-600 text-white text-sm disabled:opacity-40" onClick={() => mutation.mutate()} disabled={!ready || mutation.isPending}>{mutation.isPending ? 'Submitting…' : 'Request approval'}</button>}</div></div>
   </div>
 }
 
@@ -1531,13 +1564,51 @@ function PublishStep({ kbId, entityId, evidence, onCreated, onBack }: {
 // Main Wizard
 // ============================================================
 
-export function VersionWizard({ kbId, onClose, onCreated }: Props) {
-  const [step, setStep] = useState<Step>(1)
+/** Where a resumed proposal picks up, from what already exists for it. */
+async function resumeStep(kbId: string, entityId: string): Promise<{ step: Step; filename: string }> {
+  const [instances, taxonomy, actions, rules] = await Promise.all([
+    bpmApi.listInstances(kbId, { entity_id: entityId, limit: 1 }).then(r => r.data),
+    bpmApi.listTaxonomyProposals(kbId, entityId).then(r => r.data),
+    bpmApi.listActionProposals(kbId, entityId).then(r => r.data),
+    fetchRules(kbId, entityId).then(r => r.data),
+  ])
+  const instance = instances[0]
+  const brief = instance?.metadata?.business_brief as Partial<BusinessBrief> | undefined
+  const filename = brief?.name || entityId
+  const stage = instance?.current_stage
+  if (stage === 'PENDING_APPROVAL' || stage === 'SHADOW_GATE' || stage === 'SIMULATION_FAILED') return { step: 7, filename }
+  if (rules.length) return { step: 5, filename }
+  if (actions.length) return { step: 4, filename }
+  if (taxonomy.length) return { step: 3, filename }
+  return { step: 2, filename }
+}
+
+export function VersionWizard({ kbId, resumeEntityId, onClose, onCreated }: Props) {
+  const resume = useQuery({
+    queryKey: ['wizard-resume', kbId, resumeEntityId],
+    queryFn: () => resumeStep(kbId, resumeEntityId!),
+    enabled: !!resumeEntityId,
+    staleTime: Infinity,
+    gcTime: 0,
+  })
+  const resuming = !!resumeEntityId && !resume.data
+
+  // Until the user navigates, a resumed proposal opens where its data ends.
+  const [chosenStep, setStep] = useState<Step | null>(null)
+  const step: Step = chosenStep ?? resume.data?.step ?? 1
   const dialogRef = useRef<HTMLDivElement>(null)
   useEffect(() => { dialogRef.current?.scrollTo({ top: 0 }); dialogRef.current?.focus() }, [step])
-  const [entityId, setEntityId] = useState('')
-  const [filename, setFilename] = useState('')
-  const [evidence, setEvidence] = useState<SimResponse | null>(null)
+  // Escape must close the dialog even when focus has left it (e.g. the
+  // focused button unmounted after submitting).
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
+  const [entityId, setEntityId] = useState(resumeEntityId ?? '')
+  const [uploadedName, setFilename] = useState('')
+  const filename = uploadedName || resume.data?.filename || ''
+  const [evidence, setEvidence] = useState<SimulationGateResult | null>(null)
 
   const handleUploadDone = (eid: string, fname: string) => {
     setEntityId(eid); setFilename(fname); setStep(2)
@@ -1549,7 +1620,6 @@ export function VersionWizard({ kbId, onClose, onCreated }: Props) {
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
         <div ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-label="Create a policy change"
           onKeyDown={event => {
-            if (event.key === 'Escape') { event.stopPropagation(); onClose() }
             if (event.key !== 'Tab') return
             const elements = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), a[href], summary')).filter(el => el.getClientRects().length)
             const first = elements[0], last = elements[elements.length - 1]
@@ -1557,9 +1627,9 @@ export function VersionWizard({ kbId, onClose, onCreated }: Props) {
             else if (!event.shiftKey && (document.activeElement === last || document.activeElement === event.currentTarget)) { event.preventDefault(); first?.focus() }
           }} className="bg-surface-card border border-surface-border rounded-2xl shadow-2xl w-full max-w-3xl max-h-[92vh] overflow-y-auto">
           <div className="sticky top-0 z-10 bg-surface-card flex items-center justify-between px-6 py-4 border-b border-surface-border">
-            <div>
-              <p className="text-xs text-foreground/70 font-mono">{kbId}</p>
-              <h1 className="text-base font-semibold text-foreground">Create a policy change</h1>
+            <div className="min-w-0">
+              <p className="text-xs text-foreground/70 font-mono truncate">{entityId || kbId}</p>
+              <h1 className="text-base font-semibold text-foreground">{resumeEntityId ? 'Continue a policy change' : 'Create a policy change'}</h1>
             </div>
             <button aria-label="Close policy change" onClick={onClose} className="text-foreground/70 hover:text-foreground transition-colors">
               <X className="w-5 h-5" />
@@ -1569,10 +1639,16 @@ export function VersionWizard({ kbId, onClose, onCreated }: Props) {
           <div className="p-6">
             <StepIndicator current={step} />
 
-            {step === 1 && (
+            {resuming && (
+              resume.isError
+                ? <p role="alert" className="text-sm text-red-600">{apiErrorMessage(resume.error, 'This proposal could not be loaded.')}</p>
+                : <div className="flex justify-center py-10"><Loader2 className="w-6 h-6 animate-spin text-brand-500" /></div>
+            )}
+
+            {!resuming && step === 1 && (
               <UploadStep kbId={kbId} onNext={handleUploadDone} />
             )}
-            {step === 2 && (
+            {!resuming && step === 2 && (
               <AIAnalysisStep
                 kbId={kbId}
                 entityId={entityId}
@@ -1581,7 +1657,7 @@ export function VersionWizard({ kbId, onClose, onCreated }: Props) {
                 onBack={() => setStep(1)}
               />
             )}
-            {step === 3 && (
+            {!resuming && step === 3 && (
               <TaxonomyReviewStep
                 kbId={kbId}
                 entityId={entityId}
@@ -1589,7 +1665,7 @@ export function VersionWizard({ kbId, onClose, onCreated }: Props) {
                 onBack={() => setStep(2)}
               />
             )}
-            {step === 4 && (
+            {!resuming && step === 4 && (
               <ActionReviewStep
                 kbId={kbId}
                 entityId={entityId}
@@ -1597,7 +1673,7 @@ export function VersionWizard({ kbId, onClose, onCreated }: Props) {
                 onBack={() => setStep(3)}
               />
             )}
-            {step === 5 && (
+            {!resuming && step === 5 && (
               <ReviewRulesStep
                 kbId={kbId}
                 entityId={entityId}
@@ -1605,7 +1681,7 @@ export function VersionWizard({ kbId, onClose, onCreated }: Props) {
                 onBack={() => setStep(4)}
               />
             )}
-            {step === 6 && (
+            {!resuming && step === 6 && (
               <PreviewStep
                 kbId={kbId}
                 entityId={entityId}
@@ -1614,8 +1690,8 @@ export function VersionWizard({ kbId, onClose, onCreated }: Props) {
                 onResult={setEvidence}
               />
             )}
-            {step === 7 && (
-              <PublishStep
+            {!resuming && step === 7 && (
+              <SubmitStep
                 evidence={evidence}
                 kbId={kbId}
                 entityId={entityId}

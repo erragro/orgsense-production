@@ -15,6 +15,7 @@
 
 import { useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
+import { apiErrorMessage } from '@/lib/api-error'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Plus, Search, Trash2, Pencil, AlertTriangle, CheckCircle2,
@@ -311,6 +312,12 @@ export default function RuleEditorPage() {
             )}
           />
         </div>
+      )}
+
+      {deleteMutation.isError && (
+        <p role="alert" className="text-sm text-red-600 mb-3">
+          {apiErrorMessage(deleteMutation.error, 'The rule could not be removed.')}
+        </p>
       )}
 
       {/* Rules */}

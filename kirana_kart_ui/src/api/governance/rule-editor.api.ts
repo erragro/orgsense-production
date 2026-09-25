@@ -41,10 +41,13 @@ export interface ActionCode {
   id: number
   action_code_id: string
   action_name: string
-  action_category: string
-  requires_approval: boolean
-  is_reversible: boolean
-  severity_level: string | null
+  action_description?: string | null
+  requires_refund?: boolean
+  requires_escalation?: boolean
+  automation_eligible?: boolean
+  // Not columns of master_action_codes; kept optional for older callers.
+  action_category?: string
+  requires_approval?: boolean
 }
 
 export interface RuleCreate {

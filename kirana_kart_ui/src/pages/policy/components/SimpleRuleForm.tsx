@@ -6,6 +6,7 @@
  */
 
 import { useState } from 'react'
+import { apiErrorMessage } from '@/lib/api-error'
 import { useMutation,useQuery,useQueryClient } from '@tanstack/react-query'
 import { X,Loader2,AlertTriangle,Info } from 'lucide-react'
 import { cn } from '@/lib/cn'
@@ -100,7 +101,7 @@ export function SimpleRuleForm({ kbId, policyVersion, rule, actionCodes, onClose
       qc.invalidateQueries({ queryKey: ['rules', kbId, policyVersion] })
       onSaved()
     },
-    onError: (e: Error) => setError(e.message ?? 'Save failed. Please try again.'),
+    onError: (e: unknown) => setError(apiErrorMessage(e, 'Save failed. Please try again.')),
   })
 
   const handleSubmit = (e: React.FormEvent) => {
