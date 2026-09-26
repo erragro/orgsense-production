@@ -18,6 +18,12 @@ import uuid
 
 from sqlalchemy import text
 
+from app.l4_agents import rule_engine
+
+# Label for a case no deterministic rule decides: at runtime the AI's
+# proposal stands, and the replay does not reproduce the AI.
+AI_DECIDES = "AI_DECIDES"
+
 logger = logging.getLogger("policy_simulation")
 logger.setLevel(logging.INFO)
 
@@ -309,6 +315,9 @@ class PolicySimulationService:
                     stage1_result=stage1_result,
                     rules=rules,
                     fields=fields,
+                    # Preview each version as it would decide once enforced;
+                    # in observe mode both versions would return the AI's choice.
+                    rule_mode="enforce",
                 )
             except Exception as e:
                 stage2_error = str(e)
@@ -364,6 +373,7 @@ class PolicySimulationService:
                     "override_reason": stage2_result.get("override_reason"),
                     "validation_status": stage2_result.get("validation_status"),
                     "reasoning": stage2_result.get("reasoning"),
+                    "rule_decision": stage2_result.get("rule_decision"),
                     "error": stage2_error,
                 },
                 "stage3": stage3_result,
@@ -470,9 +480,12 @@ class PolicySimulationService:
         candidate_rules = self._load_rules_enriched(candidate_version)
 
         differences = []
+        ai_decided = 0
         for ticket in tickets:
             b_action = self._evaluate(ticket, baseline_rules)
             c_action = self._evaluate(ticket, candidate_rules)
+            if c_action == AI_DECIDES:
+                ai_decided += 1
             if b_action != c_action:
                 differences.append({
                     "ticket_id": ticket["ticket_id"],
@@ -484,6 +497,10 @@ class PolicySimulationService:
             "tickets_tested": len(tickets),
             "differences": len(differences),
             "examples": differences[:20],
+            # Cases the candidate's rules leave to the AI. Where both versions
+            # leave a case to the AI it counts as unchanged, although the AI
+            # may still decide differently.
+            "ai_decided": ai_decided,
         }
         logger.info("run_simulation done: %s", result)
         return result
@@ -516,6 +533,7 @@ class PolicySimulationService:
                     rr.action_id,
                     rr.action_payload,
                     rr.overrideable,
+                    rr.deterministic,
                     mac.action_code_id,
                     mac.action_name,
                     mac.requires_refund,
@@ -583,8 +601,9 @@ class PolicySimulationService:
         final_rule_id = None
         matched_rules = []
 
-        for rule in rules:
+        for rule in rule_engine.ordered(rules):
             matched, skip_reasons = self._rule_matches_detail(ticket_ctx, rule)
+            deciding = matched and rule_engine.is_deciding(rule)
             entry = {
                 "rule_id": rule.get("rule_id"),
                 "module_name": rule.get("module_name", ""),
@@ -593,12 +612,14 @@ class PolicySimulationService:
                 "action_name": rule.get("action_name", ""),
                 "priority": rule.get("priority", 0),
                 "matched": matched,
+                "deterministic": rule_engine.is_deciding(rule),
                 "skip_reasons": skip_reasons,   # list of why rule didn't match
                 "is_decisive": False,
             }
             if matched:
                 matched_rules.append(entry)
-                if final_action is None:
+                # Only a deterministic rule decides; others guide the AI.
+                if deciding and final_action is None:
                     final_action = rule.get("action_id")
                     final_action_code = rule.get("action_code_id", str(rule.get("action_id")))
                     final_rule_id = rule.get("rule_id")
@@ -609,7 +630,7 @@ class PolicySimulationService:
         return {
             "evaluation_trace": trace,
             "matched_rules": matched_rules,
-            "final_action": final_action_code or "NO_MATCH",
+            "final_action": final_action_code or AI_DECIDES,
             "final_action_id": final_action,
             "final_rule_id": final_rule_id,
         }
@@ -619,93 +640,20 @@ class PolicySimulationService:
     # ============================================================
 
     def _evaluate(self, ticket: dict, rules: list) -> str:
-        for rule in rules:
-            matched, _ = self._rule_matches_detail(ticket, rule)
-            if matched:
-                return rule.get("action_code_id") or str(rule.get("action_id", "NO_ACTION"))
-        return "NO_MATCH"
+        """The action the runtime would take under RULE_ENFORCEMENT=enforce."""
+        decision = rule_engine.decide(rules, rule_engine.facts_from_sample(ticket))
+        if decision is None:
+            return AI_DECIDES
+        return decision.action_code or str(decision.action_id or "NO_ACTION")
 
     def _rule_matches_detail(self, ticket: dict, rule: dict) -> tuple[bool, list]:
         """
         Returns (matched: bool, skip_reasons: list[str]).
-        skip_reasons is empty when matched=True.
+        skip_reasons is empty when matched=True. Delegates to the evaluator
+        the live pipeline uses, so a replay and a real ticket agree.
         """
-        reasons = []
-
-        # issue_type_l1
-        if rule.get("issue_type_l1"):
-            ticket_l1 = ticket.get("issue_type_l1") or ticket.get("issue_type")
-            if ticket_l1 != rule["issue_type_l1"]:
-                reasons.append(
-                    f"issue_type_l1: expected '{rule['issue_type_l1']}', got '{ticket_l1}'"
-                )
-
-        # issue_type_l2 — checked only when the ticket carries one. Saved
-        # simulation cases record a single issue type, so a specific rule
-        # cannot be distinguished from its category there.
-        ticket_l2 = ticket.get("issue_type_l2")
-        if rule.get("issue_type_l2") and ticket_l2 and ticket_l2 != rule["issue_type_l2"]:
-            reasons.append(
-                f"issue_type_l2: expected '{rule['issue_type_l2']}', got '{ticket_l2}'"
-            )
-
-        # business_line
-        if rule.get("business_line"):
-            if ticket.get("business_line") != rule["business_line"]:
-                reasons.append(
-                    f"business_line: expected '{rule['business_line']}', got '{ticket.get('business_line')}'"
-                )
-
-        # order_value
-        ov = float(ticket.get("order_value") or 0)
-        if rule.get("min_order_value") is not None and ov < float(rule["min_order_value"]):
-            reasons.append(f"order_value {ov} < min {rule['min_order_value']}")
-        if rule.get("max_order_value") is not None and ov > float(rule["max_order_value"]):
-            reasons.append(f"order_value {ov} > max {rule['max_order_value']}")
-
-        # fraud_segment
-        if rule.get("fraud_segment"):
-            if ticket.get("fraud_segment") != rule["fraud_segment"]:
-                reasons.append(
-                    f"fraud_segment: expected '{rule['fraud_segment']}', got '{ticket.get('fraud_segment')}'"
-                )
-
-        # customer_segment (maps to value_segment)
-        if rule.get("customer_segment"):
-            if ticket.get("value_segment") != rule["customer_segment"]:
-                reasons.append(
-                    f"customer_segment: expected '{rule['customer_segment']}', got '{ticket.get('value_segment')}'"
-                )
-
-        # sla_breach_required
-        if rule.get("sla_breach_required") and not ticket.get("sla_breach"):
-            reasons.append("sla_breach_required but ticket has no SLA breach")
-
-        # conditions JSON
-        conditions = rule.get("conditions") or {}
-
-        fraud_limit = conditions.get("max_fraud_score")
-        if fraud_limit is not None:
-            fraud_score = ticket.get("fraud_score", 0)
-            if fraud_score > fraud_limit:
-                reasons.append(f"fraud_score {fraud_score} > max {fraud_limit}")
-
-        required_tier = conditions.get("customer_tier")
-        if required_tier:
-            if ticket.get("customer_tier") != required_tier:
-                reasons.append(
-                    f"customer_tier: expected '{required_tier}', got '{ticket.get('customer_tier')}'"
-                )
-
-        greedy_req = conditions.get("greedy_classification")
-        if greedy_req:
-            if ticket.get("greedy_classification") != greedy_req:
-                reasons.append(
-                    f"greedy_classification: expected '{greedy_req}', got '{ticket.get('greedy_classification')}'"
-                )
-
-        matched = len(reasons) == 0
-        return matched, reasons
+        reasons = rule_engine.match_reasons(rule, rule_engine.facts_from_sample(ticket))
+        return not reasons, reasons
 
     # ============================================================
     # LEGACY COMPAT

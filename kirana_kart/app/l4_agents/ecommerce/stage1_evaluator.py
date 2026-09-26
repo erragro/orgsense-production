@@ -7,6 +7,7 @@ from typing import Any
 from app.config import settings
 from app.l4_agents.ecommerce.llm_client import LLMClient
 from app.l4_agents.ecommerce.retrieval import RetrievalService
+from app.l4_agents import rule_engine
 
 logger = logging.getLogger("stage1_evaluator")
 
@@ -69,7 +70,12 @@ def run(
         "order": order_ctx,
         "risk": risk_ctx,
         "candidate_actions": actions,
-        "rules": rules[:5],
+        # Rules about this ticket's issue, in precedence order. This used to
+        # be rules[:5]: the five lowest priority numbers of the whole
+        # policy, whatever the ticket was about.
+        "rules": rule_engine.prompt_view(
+            rule_engine.relevant(rules, {"issue_type_l1": stage0_result.get("issue_type_l1")})
+        ),
         "vector_rules": rule_hits,
     }
 

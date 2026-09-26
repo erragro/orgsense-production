@@ -27,7 +27,7 @@ from typing import Optional, Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
@@ -75,6 +75,13 @@ class RuleCreate(BaseModel):
     deterministic: bool = True
     overrideable: bool = False
 
+    @field_validator("action_payload")
+    @classmethod
+    def _amounts(cls, v: dict) -> dict:
+        # Amounts the runtime applies when this rule decides a ticket.
+        from app.l4_agents.rule_engine import validate_payload
+        return validate_payload(v)
+
 
 class RuleUpdate(BaseModel):
     module_name: Optional[str] = None
@@ -97,6 +104,12 @@ class RuleUpdate(BaseModel):
     action_payload: Optional[dict] = None
     deterministic: Optional[bool] = None
     overrideable: Optional[bool] = None
+
+    @field_validator("action_payload")
+    @classmethod
+    def _amounts(cls, v: Optional[dict]) -> Optional[dict]:
+        from app.l4_agents.rule_engine import validate_payload
+        return None if v is None else validate_payload(v)
 
 
 # ============================================================
@@ -286,7 +299,15 @@ def update_rule(
     import json
     _require_kb_access(u, kb_id, "edit")
     try:
-        updates = body.model_dump(exclude_none=True)
+        # Fields sent as null are cleared (e.g. removing an order-value bound);
+        # exclude_none used to drop them, so a cleared bound silently stayed.
+        # Columns that cannot be null are only ever changed, never cleared.
+        updates = body.model_dump(exclude_unset=True)
+        for required in ("module_name", "rule_type", "action_id", "priority", "rule_scope",
+                         "issue_type_l1", "conditions", "action_payload", "deterministic",
+                         "overrideable", "sla_breach_required", "evidence_required"):
+            if required in updates and updates[required] is None:
+                updates.pop(required)
         if not updates:
             raise HTTPException(status_code=400, detail="No fields to update")
 
@@ -295,7 +316,8 @@ def update_rule(
         params: dict[str, Any] = {"id": rule_db_id, "kb_id": kb_id}
         for key, val in updates.items():
             if key in ("conditions", "action_payload"):
-                set_parts.append(f"{key} = :{key}::jsonb")
+                # CAST, not "::jsonb": SQLAlchemy does not bind ":x::jsonb".
+                set_parts.append(f"{key} = CAST(:{key} AS jsonb)")
                 params[key] = json.dumps(val)
             else:
                 set_parts.append(f"{key} = :{key}")

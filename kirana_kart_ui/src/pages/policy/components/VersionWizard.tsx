@@ -77,7 +77,11 @@ const fetchRules = (kbId: string, version: string) =>
     min_order_value: number | null
     max_order_value: number | null
     deterministic: boolean
+    action_payload: RulePayload | null
   }>>(`/rules/${kbId}`, { params: { version } })
+
+/** Amounts the runtime applies when this rule decides (see rule_engine.py). */
+type RulePayload = { refund_amount?: number; refund_percent?: number; max_refund?: number }
 
 
 // ============================================================
@@ -922,7 +926,10 @@ type Rule = {
   min_order_value: number | null
   max_order_value: number | null
   deterministic: boolean
+  action_payload: RulePayload | null
 }
+
+type AmountMode = 'ai' | 'fixed' | 'percent'
 
 type EditDraft = {
   issue_type_l1: string
@@ -931,6 +938,9 @@ type EditDraft = {
   priority: number
   min_order_value: string
   max_order_value: string
+  amount_mode: AmountMode
+  amount_value: string
+  max_refund: string
 }
 
 // Rules are evaluated in priority order: the lower number wins.
@@ -943,16 +953,42 @@ const BLANK_DRAFT: EditDraft = {
   priority: DEFAULT_PRIORITY,
   min_order_value: '',
   max_order_value: '',
+  amount_mode: 'ai',
+  amount_value: '',
+  max_refund: '',
 }
 
-const toPayload = (draft: EditDraft) => ({
-  issue_type_l1: draft.issue_type_l1.trim(),
-  issue_type_l2: draft.issue_type_l2.trim() || null,
-  action_id: draft.action_id,
-  priority: draft.priority,
-  min_order_value: draft.min_order_value ? parseFloat(draft.min_order_value) : null,
-  max_order_value: draft.max_order_value ? parseFloat(draft.max_order_value) : null,
+const draftAmounts = (payload: RulePayload | null) => ({
+  amount_mode: (payload?.refund_amount != null ? 'fixed' : payload?.refund_percent != null ? 'percent' : 'ai') as AmountMode,
+  amount_value: String(payload?.refund_amount ?? payload?.refund_percent ?? ''),
+  max_refund: payload?.max_refund != null ? String(payload.max_refund) : '',
 })
+
+const toPayload = (draft: EditDraft) => {
+  const action_payload: RulePayload = {}
+  if (draft.amount_mode === 'fixed' && draft.amount_value) action_payload.refund_amount = parseFloat(draft.amount_value)
+  if (draft.amount_mode === 'percent' && draft.amount_value) action_payload.refund_percent = parseFloat(draft.amount_value)
+  if (draft.max_refund) action_payload.max_refund = parseFloat(draft.max_refund)
+  return {
+    issue_type_l1: draft.issue_type_l1.trim(),
+    issue_type_l2: draft.issue_type_l2.trim() || null,
+    action_id: draft.action_id,
+    priority: draft.priority,
+    min_order_value: draft.min_order_value ? parseFloat(draft.min_order_value) : null,
+    max_order_value: draft.max_order_value ? parseFloat(draft.max_order_value) : null,
+    action_payload,
+  }
+}
+
+/** Plain-English amount a deciding rule gives. */
+function amountSummary(payload: RulePayload | null): string {
+  const parts: string[] = []
+  if (payload?.refund_amount != null) parts.push(`Refund ₹${payload.refund_amount}`)
+  else if (payload?.refund_percent != null) parts.push(`Refund ${payload.refund_percent}% of order`)
+  else parts.push('Amount proposed by the AI')
+  if (payload?.max_refund != null) parts.push(`capped at ₹${payload.max_refund}`)
+  return parts.join(', ')
+}
 
 function RuleFields({ kbId, draft, setDraft }: {
   kbId: string
@@ -1004,6 +1040,27 @@ function RuleFields({ kbId, draft, setDraft }: {
             placeholder="Any" />
         </label>
       </div>
+      <fieldset className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        <legend className="text-xs text-foreground/70 mb-0.5">Amount when this rule decides</legend>
+        <label className="text-xs text-foreground/70 block">Refund
+          <select className={inp + ' mt-0.5'} aria-label="Refund amount source" value={draft.amount_mode}
+            onChange={e => setDraft(d => ({ ...d, amount_mode: e.target.value as AmountMode, amount_value: '' }))}>
+            <option value="ai">Proposed by the AI</option>
+            <option value="fixed">Fixed amount (₹)</option>
+            <option value="percent">% of order value</option>
+          </select>
+        </label>
+        {draft.amount_mode !== 'ai' && (
+          <label className="text-xs text-foreground/70 block">{draft.amount_mode === 'fixed' ? 'Amount (₹)' : 'Percent of order'}
+            <input className={inp + ' mt-0.5'} type="number" min={0} max={draft.amount_mode === 'percent' ? 100 : undefined}
+              value={draft.amount_value} onChange={e => setDraft(d => ({ ...d, amount_value: e.target.value }))} />
+          </label>
+        )}
+        <label className="text-xs text-foreground/70 block">Never more than (₹)
+          <input className={inp + ' mt-0.5'} type="number" min={0} value={draft.max_refund}
+            onChange={e => setDraft(d => ({ ...d, max_refund: e.target.value }))} placeholder="No cap" />
+        </label>
+      </fieldset>
     </>
   )
 }
@@ -1027,6 +1084,7 @@ function RuleCard({
     priority: rule.priority,
     min_order_value: rule.min_order_value != null ? String(rule.min_order_value) : '',
     max_order_value: rule.max_order_value != null ? String(rule.max_order_value) : '',
+    ...draftAmounts(rule.action_payload),
   })
 
   const saveMut = useMutation({
@@ -1075,11 +1133,14 @@ function RuleCard({
             <span className="text-xs px-2 py-0.5 rounded-full bg-surface text-foreground/70 border border-surface-border">
               Priority {rule.priority}
             </span>
-            {rule.deterministic && (
-              <span className="text-xs text-green-600 bg-green-50 dark:bg-green-900/20 px-2 py-0.5 rounded-full">Auto</span>
+            {rule.deterministic ? (
+              <span className="text-xs text-green-600 bg-green-50 dark:bg-green-900/20 px-2 py-0.5 rounded-full" title="When it matches, this rule sets the decision">Decides</span>
+            ) : (
+              <span className="text-xs text-foreground/70 bg-surface border border-surface-border px-2 py-0.5 rounded-full" title="Shown to the AI as guidance only">Guidance</span>
             )}
           </div>
           <p className="text-sm font-medium text-foreground mt-1.5">{rule.action_name}</p>
+          {rule.deterministic && <p className="text-xs text-foreground/70 mt-0.5">{amountSummary(rule.action_payload)}</p>}
           {(rule.min_order_value != null || rule.max_order_value != null) && (
             <p className="text-xs text-foreground/70 mt-0.5">
               Order value:{' '}

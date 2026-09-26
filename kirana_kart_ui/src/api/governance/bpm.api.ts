@@ -206,6 +206,19 @@ export interface ProposalReadiness {
   live_comparison_cases: number
 }
 
+export interface RuleDecisionSummary {
+  /** RULE_ENFORCEMENT: observe records only; enforce lets rules decide. */
+  mode: 'observe' | 'enforce'
+  days: number
+  evaluated: number
+  matched: number
+  applied: number
+  /** Matched tickets where the rule's decision differs from the AI's. */
+  differs: number
+  last_evaluated_at: string | null
+  by_rule: Array<{ rule_id: string; rule_action: string | null; matched: number; differs: number }>
+}
+
 export interface GeneratedRule {
   rule_id: string
   issue_type_l1: string
@@ -287,6 +300,9 @@ export const bpmApi = {
       entity_id: entityId,
       justification,
     }),
+
+  getRuleDecisionSummary: (days = 7) =>
+    apiClient.get<RuleDecisionSummary>('/bpm/rule-decisions/summary', { params: { days } }),
 
   getReadiness: (kbId: string, entityId: string) =>
     apiClient.get<ProposalReadiness>(`/bpm/kb/${kbId}/proposals/${entityId}/readiness`),

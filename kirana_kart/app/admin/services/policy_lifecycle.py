@@ -253,12 +253,17 @@ def run_simulation_gate(conn, kb_id: str, entity_id: str, actor, simulator) -> d
             "changed_count": changed,
             "ticket_count": tested,
             "rule_count": counts["rules"],
+            "ai_decided_count": int(result.get("ai_decided") or 0),
             "baseline_version": baseline,
             "candidate_version": entity_id,
             "threshold": SIMULATION_GATE_THRESHOLD,
             "sample_source": "Saved simulation cases (up to 1,000; not a dated or representative sample)",
             "examples": examples,
-            "measurement_scope": "Final action differences only; financial impact and customer outcomes are not measured",
+            "measurement_scope": (
+                "Final action differences only, as rules would decide under RULE_ENFORCEMENT=enforce; "
+                "cases no rule decides are left to the AI and not replayed. Financial impact and "
+                "customer outcomes are not measured"
+            ),
             "rules_fingerprint": rules_fingerprint(conn, entity_id),
         }
 

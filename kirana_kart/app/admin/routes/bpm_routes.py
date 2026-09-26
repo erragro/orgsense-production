@@ -708,6 +708,58 @@ def proposal_readiness(kb_id: str, entity_id: str, u: UserContext = Depends(_kb_
         return jsonable_encoder(lifecycle.readiness(conn, kb_id, entity_id))
 
 
+_policy_view = require_permission("policy", "view")
+
+
+@router.get("/rule-decisions/summary")
+def rule_decision_summary(
+    days: int = Query(7, ge=1, le=90),
+    u: UserContext = Depends(_policy_view),
+):
+    """
+    How Policy Studio rules took part in recent live decisions. In observe
+    mode this is the evidence for switching RULE_ENFORCEMENT to enforce: how
+    often a rule matched, and how often it would have changed the outcome.
+    """
+    from sqlalchemy import text
+    from app.config import settings
+
+    with engine.connect() as conn:
+        totals = conn.execute(text("""
+            SELECT COUNT(*)                                                     AS evaluated,
+                   COUNT(*) FILTER (WHERE (rule_decision->>'matched')::boolean) AS matched,
+                   COUNT(*) FILTER (WHERE (rule_decision->>'applied')::boolean) AS applied,
+                   COUNT(*) FILTER (WHERE (rule_decision->>'matched')::boolean
+                                      AND NOT COALESCE((rule_decision->>'agrees')::boolean, TRUE))
+                                                                                AS differs,
+                   MAX(created_at)                                              AS last_evaluated_at
+            FROM kirana_kart.llm_output_3
+            WHERE rule_decision IS NOT NULL
+              AND created_at >= NOW() - make_interval(days => :days)
+        """), {"days": days}).mappings().first()
+        by_rule = conn.execute(text("""
+            SELECT rule_decision->>'rule_id'                                    AS rule_id,
+                   rule_decision->>'rule_action'                                AS rule_action,
+                   COUNT(*)                                                     AS matched,
+                   COUNT(*) FILTER (WHERE NOT COALESCE((rule_decision->>'agrees')::boolean, TRUE))
+                                                                                AS differs
+            FROM kirana_kart.llm_output_3
+            WHERE rule_decision IS NOT NULL
+              AND (rule_decision->>'matched')::boolean
+              AND created_at >= NOW() - make_interval(days => :days)
+            GROUP BY 1, 2
+            ORDER BY differs DESC, matched DESC
+            LIMIT 10
+        """), {"days": days}).mappings().all()
+
+    return jsonable_encoder({
+        "mode": settings.rule_enforcement,
+        "days": days,
+        **{k: (int(v) if k != "last_evaluated_at" and v is not None else v) for k, v in dict(totals).items()},
+        "by_rule": [dict(r) for r in by_rule],
+    })
+
+
 @router.post("/kb/{kb_id}/publish")
 def publish_version_bpm(
     kb_id: str,

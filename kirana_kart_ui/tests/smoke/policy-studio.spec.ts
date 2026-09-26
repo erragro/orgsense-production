@@ -31,11 +31,15 @@ test(`business proposal carries intent into an honest approval request (publishe
     else if (path.endsWith('/simulate')) { state.stage = 'SIMULATION_FAILED'; json = {status:'ok', passed:false, stage:'SIMULATION_FAILED', metrics:{unchanged_rate:0.7,changed_count:3,ticket_count:10,rule_count:1,baseline_version:'current',candidate_version:'proposal-1',threshold:0.8}, examples:[{ticket_id:1,baseline:'Manual review',candidate:'Refund missing item'}]} }
     else if (path.endsWith('/readiness')) json = { stage:state.stage, review:{taxonomy_pending:0,taxonomy_accepted:1,actions_pending:0,actions_accepted:1,rules:1}, preparation_status: state.stage === 'PENDING_APPROVAL' ? 'pending' : null, rules_unchanged_since_submission:false, pending_approval:null, live_version:'current', live_comparison_version:null, live_comparison_cases:0 }
     else if (path.endsWith('/submit')) { justification = JSON.parse(route.request().postData() ?? '{}').justification; state.stage = 'PENDING_APPROVAL'; json = { stage:'PENDING_APPROVAL', approval:{id:5} } }
+    else if (path.endsWith('/rule-decisions/summary')) json = { mode:'observe', days:7, evaluated:40, matched:30, applied:0, differs:6, last_evaluated_at:'2026-09-25T10:00:00Z', by_rule:[{ rule_id:'R-MISSING-REFUND', rule_action:'REFUND', matched:30, differs:6 }] }
     else if (path.endsWith('/publish')) throw new Error('The wizard must not activate a policy')
     await route.fulfill({ json })
   })
   await page.goto('/policy/bpm')
   await expect(page.getByRole('heading', { name:'Policy Studio', exact:true })).toBeVisible()
+  const rulesPanel = page.getByRole('region', { name:'Rules in live decisions' })
+  await expect(rulesPanel.getByText('Observe only: rules do not change decisions')).toBeVisible()
+  await expect(rulesPanel.getByText('on 6 (15%) it would have decided differently from the AI', { exact:false })).toBeVisible()
   await page.getByText('How customer problems, decisions and tests connect').click()
   await expect(page.getByText('Illustrative example:', { exact:false })).toBeVisible()
   await page.screenshot({ path:testInfo.outputPath('policy-studio.png'), fullPage:true })
@@ -64,6 +68,9 @@ test(`business proposal carries intent into an honest approval request (publishe
   await expect(dialog.getByRole('spinbutton').first()).toHaveValue('0')
   await expect(dialog.getByRole('button', {name:'Add Rule',exact:true})).toBeDisabled()
   await dialog.getByLabel('Action to take *').selectOption('3')
+  await dialog.getByLabel('Refund amount source').selectOption('percent')
+  await dialog.getByLabel('Percent of order').fill('50')
+  await dialog.getByLabel('Never more than (₹)').fill('400')
   await dialog.getByRole('button', {name:'Cancel',exact:true}).click()
   await dialog.getByRole('button', {name:'Compare sample decisions',exact:true}).click()
   await dialog.getByRole('button', {name:'Run Preview',exact:true}).click()

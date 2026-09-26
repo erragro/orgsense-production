@@ -21,6 +21,7 @@ import { BPMStageDrawer } from './components/BPMStageDrawer'
 import { VersionWizard } from './components/VersionWizard'
 import { PolicyValueIntro } from './components/PolicyValueIntro'
 import { MLHealthPanel } from './components/MLHealthPanel'
+import { RuleEnforcementPanel } from './components/RuleEnforcementPanel'
 import { CLOSED_STAGES } from './stages'
 
 export default function PolicyBPMPage() {
@@ -84,6 +85,8 @@ export default function PolicyBPMPage() {
       </div>
 
       <PolicyValueIntro />
+
+      <RuleEnforcementPanel />
 
       {isLoading && (
         <div className="flex justify-center py-16">

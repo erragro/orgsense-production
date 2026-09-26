@@ -337,11 +337,11 @@ def search_tickets(
         params["module"] = module
 
     if date_from:
-        filters.append("f.created_at >= :date_from::date")
+        filters.append("f.created_at >= CAST(:date_from AS date)")
         params["date_from"] = date_from
 
     if date_to:
-        filters.append("f.created_at < (:date_to::date + interval '1 day')")
+        filters.append("f.created_at < (CAST(:date_to AS date) + interval '1 day')")
         params["date_to"] = date_to
 
     where = "WHERE " + " AND ".join(filters)

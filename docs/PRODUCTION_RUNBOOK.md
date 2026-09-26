@@ -72,7 +72,11 @@ recorded in `kirana_kart/coverage-floor.json`; it does not invent a target perce
    defaults to `true` (the submitter cannot approve their own change); set it to
    `false` only for a single-owner deployment. Proposals already awaiting approval
    before this revision must be re-submitted (Retry runtime preparation) once.
-8. Deploy `worker-beat` as **one** replica with Recreate, and workers consuming
+8. Revision 0009 adds `llm_output_3.rule_decision`. `RULE_ENFORCEMENT` defaults
+   to `observe`: rules are evaluated and recorded but do not change outcomes.
+   Switch to `enforce` (API and workers) only after reviewing Policy Studio's
+   "Rules in live decisions" panel; switching back to `observe` is immediate.
+9. Deploy `worker-beat` as **one** replica with Recreate, and workers consuming
    both `cardinal` and `celery` queues. Verify a retention task actually executes.
    Cloud Run worker deployments need continuous CPU/instances appropriate to
    background processing; the repository does not provision those settings.

@@ -167,10 +167,10 @@ Remaining limits, not addressed here:
 - **Live comparison (shadow) is still not evaluated in the pipeline.** Approval
   shows the recorded case count, currently zero. SHADOW_GATE therefore means
   "tested on samples", not "observed live".
-- **The replay is an approximation.** The runtime chooses actions with an LLM
-  over rule candidates; the replay applies rules first-match. Sample cases carry
-  one issue type, so a specific (L2) rule cannot be distinguished from its
-  category there.
+- **The replay covers rule decisions only.** Cases no rule decides are left to
+  the AI at runtime and are not replayed. Sample cases carry one issue type, so
+  rules for a specific (L2) situation never match there. (Superseded in part:
+  see "Rules decide" below.)
 - **Legacy publication routes remain:** `POST /kb/publish` and `/kb/rollback`
   now require `policy.admin` (previously `knowledgeBase.admin` alone) and record
   the authenticated publisher rather than a client-supplied name, but they still
@@ -179,3 +179,66 @@ Remaining limits, not addressed here:
   `policy_lifecycle` before relying on the approval trail as a complete control.
 - Proposals awaiting approval before this revision must be re-submitted once so
   their runtime preparation is created.
+
+## Rules decide — 26 September 2026
+
+Measured against the SOP-Writer Wizard and Rule Editor mockups, the core gap was
+that rules did not govern decisions. Stage 1 showed the LLM the first five
+rules of the whole policy (`rules[:5]`), whatever the ticket was about. No
+condition was evaluated anywhere at runtime, Stage 2 never compared the LLM's
+choice with the rules, and rule amounts (`action_payload`) were ignored. The
+replay evaluated three legacy condition keys, so rules built in the condition
+editor matched every sample case.
+
+Now implemented (`app/l4_agents/rule_engine.py`, one evaluator for runtime and
+replay):
+
+- **Evaluation:** a rule holds when its issue category, column filters
+  (business line, segment, fraud segment, order value, prior complaints, SLA
+  breach) and condition tree (ALL/ANY, nested) all hold. Rules are tried in
+  runtime precedence (priority ascending, then rule id).
+  - **Fails closed:** a condition the evaluator cannot read, or a fact the
+    ticket does not provide, means *no match*.
+  - **Guidance-only rules:** rules marked non-deterministic are shown to the AI
+    but never decide.
+- **Stage 2 applies the first matching rule** before the tier bypass, fraud
+  zeroing and routing, so those safety checks still govern the result.
+  - **Action and amount:** the rule sets the action. `action_payload` sets
+    `refund_amount`, `refund_percent` and/or `max_refund`, and the result is
+    always within the order value.
+  - **No stated amount:** a non-refund action pays nothing, and a refund action
+    keeps the AI's amount within the rule's cap.
+  - **Evidence required:** the ticket goes to a person.
+- **`RULE_ENFORCEMENT`** (default **`observe`**): observe records the rule's
+  decision next to the actual outcome in `llm_output_3.rule_decision` (migration
+  0009) and changes nothing. Enforce lets rules decide. Policy Studio's "Rules in
+  live decisions" panel (`GET /bpm/rule-decisions/summary`) shows how often a
+  rule matched and how often it would change the outcome — the evidence for
+  switching.
+- **Stage 1 guidance:** the AI is shown the rules about the ticket's issue, in
+  precedence order, instead of the first five of the policy.
+- **Replay:** the sample replay and the full-pipeline ticket simulation use the
+  same evaluator and preview enforce mode. The replay reports how many cases the
+  candidate's rules leave to the AI.
+- **Editors:** both rule editors set the amount a deciding rule gives, and
+  amounts are validated on the server. The advanced editor no longer refuses
+  generated rules, whose empty `{}` conditions it treated as an unknown format.
+  Rule updates can now clear optional fields such as an order-value bound.
+  Editing a rule's conditions or amounts no longer fails on an unbound
+  `::jsonb` cast. The same bug was fixed in the Cardinal and QA Agent date
+  filters.
+
+Validation: 42 unit tests for the evaluator and Stage 2 in both modes, plus a
+PostgreSQL integration test. The integration test runs the worker's rule query,
+Stage 2 with its real action-registry lookup, the `llm_output_3` write and the
+summary endpoint. Browser tests cover the panel and the amount inputs.
+
+Before switching to enforce:
+
+- **Issue codes:** Stage 0's categories must use the same codes as the rules.
+  The evaluator ignores case, spaces and hyphens, but different names never
+  match.
+- **Observe first:** in the current live policy, conditions have never been
+  evaluated. Watch the panel for at least a representative period, and review
+  every rule that differs from the AI often.
+- **Unused flag:** `overrideable` is still not interpreted by the runtime.

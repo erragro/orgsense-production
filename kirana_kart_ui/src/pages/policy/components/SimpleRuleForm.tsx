@@ -52,7 +52,15 @@ export function SimpleRuleForm({ kbId, policyVersion, rule, actionCodes, onClose
   const [evidenceRequired, setEvidenceRequired] = useState(rule?.evidence_required ?? false)
   const [deterministic, setDeterministic] = useState(rule?.deterministic ?? true)
   const [overrideable, setOverrideable] = useState(rule?.overrideable ?? false)
-  const unsupportedConditions = rule?.conditions != null && !isCondition(rule.conditions)
+  const payload = (rule?.action_payload ?? {}) as { refund_amount?: number; refund_percent?: number; max_refund?: number }
+  const [amountMode, setAmountMode] = useState<'ai' | 'fixed' | 'percent'>(
+    payload.refund_amount != null ? 'fixed' : payload.refund_percent != null ? 'percent' : 'ai')
+  const [amountValue, setAmountValue] = useState(String(payload.refund_amount ?? payload.refund_percent ?? ''))
+  const [maxRefund, setMaxRefund] = useState(payload.max_refund != null ? String(payload.max_refund) : '')
+  // Generated rules store conditions as {}: no conditions, not an unknown format.
+  const emptyStored = !!rule?.conditions && typeof rule.conditions === 'object' && !Array.isArray(rule.conditions) &&
+    Object.keys(rule.conditions).length === 0
+  const unsupportedConditions = rule?.conditions != null && !emptyStored && !isCondition(rule.conditions)
   const [conditions, setConditions] = useState<Condition>(
     () => (isCondition(rule?.conditions)
       ? rule!.conditions
@@ -92,6 +100,13 @@ export function SimpleRuleForm({ kbId, policyVersion, rule, actionCodes, onClose
         deterministic,
         overrideable,
         conditions: { ...conditions },
+        // Amounts the runtime applies when this rule decides a ticket.
+        action_payload: {
+          ...(rule?.action_payload ?? {}),
+          refund_amount: amountMode === 'fixed' && amountValue ? Number(amountValue) : undefined,
+          refund_percent: amountMode === 'percent' && amountValue ? Number(amountValue) : undefined,
+          max_refund: maxRefund ? Number(maxRefund) : undefined,
+        },
       }
       return isEdit
         ? ruleApi.updateRule(kbId, rule!.id, payload)
@@ -287,6 +302,43 @@ export function SimpleRuleForm({ kbId, policyVersion, rule, actionCodes, onClose
               </div>
             </div>
 
+            {/* Amount when this rule decides */}
+            <div>
+              <label className="block text-sm font-medium text-foreground mb-1.5">
+                Amount when this rule decides
+              </label>
+              <div className="grid grid-cols-3 gap-3">
+                <select
+                  aria-label="Refund amount source"
+                  value={amountMode}
+                  onChange={(e) => { setAmountMode(e.target.value as 'ai' | 'fixed' | 'percent'); setAmountValue('') }}
+                  className="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-brand-500"
+                >
+                  <option value="ai">Proposed by the AI</option>
+                  <option value="fixed">Fixed amount (₹)</option>
+                  <option value="percent">% of order value</option>
+                </select>
+                {amountMode !== 'ai' ? (
+                  <input
+                    type="number" min={0} max={amountMode === 'percent' ? 100 : undefined}
+                    aria-label={amountMode === 'fixed' ? 'Refund amount (₹)' : 'Refund percent of order'}
+                    value={amountValue}
+                    onChange={(e) => setAmountValue(e.target.value)}
+                    className="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-brand-500"
+                  />
+                ) : <span />}
+                <input
+                  type="number" min={0}
+                  aria-label="Never more than (₹)"
+                  placeholder="No cap (₹)"
+                  value={maxRefund}
+                  onChange={(e) => setMaxRefund(e.target.value)}
+                  className="w-full bg-surface-card border border-surface-border rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-brand-500"
+                />
+              </div>
+              <p className="text-xs text-muted mt-1">A non-refund action with no amount pays nothing. Fraud and review checks still apply.</p>
+            </div>
+
             {/* Customer & fraud segment */}
             <div className="grid grid-cols-2 gap-3">
               <div>
@@ -324,8 +376,8 @@ export function SimpleRuleForm({ kbId, policyVersion, rule, actionCodes, onClose
               <label className="block text-sm font-medium text-foreground mb-1">Rule flags</label>
               {[
                 { label: 'SLA must be breached for this rule to apply', value: slaRequired, set: setSlaRequired },
-                { label: 'Evidence (photos / docs) required from customer', value: evidenceRequired, set: setEvidenceRequired },
-                { label: 'Apply automatically (no human review needed)', value: deterministic, set: setDeterministic },
+                { label: 'Evidence required: a person reviews tickets this rule decides', value: evidenceRequired, set: setEvidenceRequired },
+                { label: 'This rule decides when it matches (off: guidance for the AI only)', value: deterministic, set: setDeterministic },
                 { label: 'Support agents can override this rule', value: overrideable, set: setOverrideable },
               ].map(({ label, value, set }) => (
                 <label key={label} className="flex items-center gap-3 cursor-pointer group">
