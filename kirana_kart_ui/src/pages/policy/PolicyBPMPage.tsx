@@ -21,30 +21,8 @@ import { BPMStageDrawer } from './components/BPMStageDrawer'
 import { VersionWizard } from './components/VersionWizard'
 import { PolicyValueIntro } from './components/PolicyValueIntro'
 import { MLHealthPanel } from './components/MLHealthPanel'
-
-// Map BPM stage names to plain-English status labels for display
-export const STAGE_LABEL: Record<string, string> = {
-  DRAFT:                  'Starting up',
-  AI_COMPILE_QUEUED:      'AI is analyzing document',
-  AI_COMPILE_FAILED:      'Analysis failed',
-  RULE_EDIT:              'Reviewing rules',
-  SIMULATION_GATE:        'Running impact preview',
-  SIMULATION_FAILED:      'Impact comparison needs review',
-  SHADOW_GATE:            'Live comparison stage — verify evidence',
-  SHADOW_DIVERGENCE_HIGH: 'Live comparison differences need review',
-  PENDING_APPROVAL:       'Waiting for approval',
-  REJECTED:               'Rejected',
-  ACTIVE:                 'Active',
-  ROLLBACK_PENDING:       'Restore request pending',
-  RETIRED:                'Retired',
-}
-
-export const STAGE_GROUP = (stage: string): 'active' | 'in_progress' | 'done' | 'failed' => {
-  if (stage === 'ACTIVE') return 'active'
-  if (['RETIRED', 'REJECTED', 'SIMULATION_FAILED', 'AI_COMPILE_FAILED', 'SHADOW_DIVERGENCE_HIGH'].includes(stage)) return 'failed'
-  if (['PENDING_APPROVAL', 'SHADOW_GATE', 'SIMULATION_GATE'].includes(stage)) return 'in_progress'
-  return 'in_progress'
-}
+import { RuleEnforcementPanel } from './components/RuleEnforcementPanel'
+import { CLOSED_STAGES } from './stages'
 
 export default function PolicyBPMPage() {
   const { activeKbId, getActiveKB } = useKBStore()
@@ -53,6 +31,7 @@ export default function PolicyBPMPage() {
 
   const [selectedInstance, setSelectedInstance] = useState<BPMInstance | null>(null)
   const [showWizard, setShowWizard] = useState(false)
+  const [resumeEntity, setResumeEntity] = useState<string | null>(null)
 
   const canEdit  = hasPermission(user, 'policy', 'edit')
   const canAdmin = hasPermission(user, 'policy', 'admin') || !!user?.is_super_admin
@@ -65,9 +44,9 @@ export default function PolicyBPMPage() {
     refetchInterval: 30_000, // refresh every 30s for in-progress gates
   })
 
-  const inProgress = instances.filter((i) => !['ACTIVE', 'RETIRED', 'REJECTED', 'SIMULATION_FAILED', 'AI_COMPILE_FAILED', 'SHADOW_DIVERGENCE_HIGH'].includes(i.current_stage))
+  const inProgress = instances.filter((i) => i.current_stage !== 'ACTIVE' && !CLOSED_STAGES.includes(i.current_stage))
   const published  = instances.filter((i) => i.current_stage === 'ACTIVE')
-  const retired    = instances.filter((i) => ['RETIRED', 'REJECTED', 'SIMULATION_FAILED', 'AI_COMPILE_FAILED', 'SHADOW_DIVERGENCE_HIGH'].includes(i.current_stage))
+  const retired    = instances.filter((i) => CLOSED_STAGES.includes(i.current_stage))
 
   return (
     <div className="max-w-4xl mx-auto py-8 px-4">
@@ -95,7 +74,7 @@ export default function PolicyBPMPage() {
           </button>
           {canEdit && (
             <button
-              onClick={() => setShowWizard(true)}
+              onClick={() => { setResumeEntity(null); setShowWizard(true) }}
               className="flex items-center gap-2 px-4 py-2 bg-brand-600 text-white rounded-lg text-sm font-medium hover:bg-brand-700 transition-colors"
             >
               <Plus className="w-4 h-4" />
@@ -106,6 +85,8 @@ export default function PolicyBPMPage() {
       </div>
 
       <PolicyValueIntro />
+
+      <RuleEnforcementPanel />
 
       {isLoading && (
         <div className="flex justify-center py-16">
@@ -136,12 +117,12 @@ export default function PolicyBPMPage() {
       {/* Active / Published */}
       <Section
         emoji="✅"
-        title="Published"
+        title="Live"
         count={published.length}
         className="mb-6"
       >
         {published.length === 0 && (
-          <p className="text-sm text-muted py-4 text-center">No active version yet.</p>
+          <p className="text-sm text-muted py-4 text-center">No version is live yet.</p>
         )}
         {published.map((inst) => (
           <VersionCard
@@ -181,6 +162,8 @@ export default function PolicyBPMPage() {
           instance={selectedInstance}
           kbId={activeKbId}
           canAdmin={canAdmin}
+          canEdit={canEdit}
+          onResume={() => { setResumeEntity(selectedInstance.entity_id); setSelectedInstance(null); setShowWizard(true) }}
           onClose={() => setSelectedInstance(null)}
           onRefresh={() => {
             qc.invalidateQueries({ queryKey: ['bpm', 'instances', activeKbId] })
@@ -201,7 +184,8 @@ export default function PolicyBPMPage() {
       {showWizard && (
         <VersionWizard
           kbId={activeKbId}
-          onClose={() => setShowWizard(false)}
+          resumeEntityId={resumeEntity ?? undefined}
+          onClose={() => { setShowWizard(false); qc.invalidateQueries({ queryKey: ['bpm', 'instances', activeKbId] }) }}
           onCreated={() => {
             qc.invalidateQueries({ queryKey: ['bpm', 'instances', activeKbId] })
             setShowWizard(false)

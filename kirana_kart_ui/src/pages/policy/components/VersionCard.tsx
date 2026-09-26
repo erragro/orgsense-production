@@ -6,7 +6,7 @@
 import { Clock, User, ChevronRight, RotateCcw, CheckCircle2, Loader2, XCircle } from 'lucide-react'
 import { cn } from '@/lib/cn'
 import type { BPMInstance } from '@/api/governance/bpm.api'
-import { STAGE_LABEL } from '../PolicyBPMPage'
+import { STAGE_LABEL } from '../stages'
 
 interface Props {
   instance: BPMInstance
@@ -34,9 +34,9 @@ const STAGE_COLOR: Record<string, string> = {
 const STAGE_ICON: Record<string, typeof Loader2> = {
   ACTIVE:            CheckCircle2,
   PENDING_APPROVAL:  Clock,
-  SHADOW_GATE:       Loader2,
+  SHADOW_GATE:       CheckCircle2,
   SIMULATION_GATE:   Loader2,
-  AI_COMPILE_QUEUED: Loader2,
+  AI_COMPILE_QUEUED: Clock,
   AI_COMPILE_FAILED: XCircle,
   SIMULATION_FAILED: XCircle,
   SHADOW_DIVERGENCE_HIGH: XCircle,
@@ -45,19 +45,19 @@ const STAGE_ICON: Record<string, typeof Loader2> = {
 }
 
 const STEP_MAP: Record<string, string> = {
-  DRAFT:                  'Step 1 of 5 — Starting',
-  AI_COMPILE_QUEUED:      'Step 2 of 5 — AI analyzing',
-  AI_COMPILE_FAILED:      'Step 2 of 5 — Analysis failed',
-  RULE_EDIT:              'Step 3 of 5 — Reviewing rules',
-  SIMULATION_GATE:        'Step 4 of 5 — Running impact preview',
-  SIMULATION_FAILED:      'Step 4 of 5 — Review impact differences',
-  SHADOW_GATE:            'Step 4 of 5 — Live comparison — verify evidence',
+  DRAFT:                  'Step 1 of 5 — Proposal created',
+  AI_COMPILE_QUEUED:      'Step 2 of 5 — Review customer problems and responses',
+  AI_COMPILE_FAILED:      'Step 2 of 5 — Analysis failed: retry',
+  RULE_EDIT:              'Step 3 of 5 — Review decisions, then compare samples',
+  SIMULATION_GATE:        'Step 4 of 5 — Comparing sample decisions',
+  SIMULATION_FAILED:      'Step 4 of 5 — Larger change: justify or revise',
+  SHADOW_GATE:            'Step 4 of 5 — Tested: request approval',
   SHADOW_DIVERGENCE_HIGH: 'Step 4 of 5 — Live comparison: review changes',
-  PENDING_APPROVAL:       'Step 5 of 5 — Waiting for approval',
-  REJECTED:               'Rejected — needs revision',
-  ACTIVE:                 'Published and live',
+  PENDING_APPROVAL:       'Step 5 of 5 — Waiting for a second approver',
+  REJECTED:               'Rejected — reopen to revise',
+  ACTIVE:                 'Live for new tickets',
   ROLLBACK_PENDING:       'Restore request pending',
-  RETIRED:                'Retired',
+  RETIRED:                'Retired — replaced by a newer version',
 }
 
 function formatAge(dateStr: string): string {
@@ -74,12 +74,13 @@ export function VersionCard({ instance, onOpen }: Props) {
   const { current_stage: stage } = instance
   const colorCls  = STAGE_COLOR[stage] ?? 'text-muted bg-surface'
   const Icon      = STAGE_ICON[stage] ?? Clock
-  const isSpinner = ['AI_COMPILE_QUEUED', 'SIMULATION_GATE', 'SHADOW_GATE'].includes(stage)
+  const isSpinner = stage === 'SIMULATION_GATE'
 
   const primaryAction =
     stage === 'RULE_EDIT' ? 'Continue reviewing'
     : stage === 'PENDING_APPROVAL' ? 'View approval request'
-    : stage === 'SIMULATION_FAILED' ? 'View failure details'
+    : stage === 'SIMULATION_FAILED' ? 'Justify or revise'
+    : stage === 'SHADOW_GATE' ? 'Request approval'
     : stage === 'AI_COMPILE_FAILED' ? 'Retry or edit'
     : stage === 'SHADOW_DIVERGENCE_HIGH' ? 'Review changes'
     : 'View details'

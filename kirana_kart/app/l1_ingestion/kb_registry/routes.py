@@ -58,6 +58,9 @@ logger = logging.getLogger("kb_routes")
 _kb_view  = require_permission("knowledgeBase", "view")
 _kb_edit  = require_permission("knowledgeBase", "edit")
 _kb_admin = require_permission("knowledgeBase", "admin")
+# Publishing or rolling back changes the policy serving every ticket, so it
+# needs the same permission as Policy Studio activation.
+_policy_admin = require_permission("policy", "admin")
 logging.basicConfig(level=logging.INFO)
 
 
@@ -89,7 +92,7 @@ class UpdateRequest(BaseModel):
 
 class PublishRequest(BaseModel):
     version_label: str
-    published_by: str
+    published_by: str = ""   # ignored: the authenticated user is recorded
     kb_id: str = "default"
 
 
@@ -155,13 +158,15 @@ def update_kb(raw_id: int, request: UpdateRequest, _u: UserContext = Depends(_kb
 # ------------------------------------------------------------
 
 @router.post("/publish")
-def publish_kb(request: PublishRequest, _u: UserContext = Depends(_kb_admin)):
+def publish_kb(request: PublishRequest, _u: UserContext = Depends(_policy_admin)):
 
     try:
 
+        # The authenticated user is the publisher of record; the client-supplied
+        # published_by was accepted verbatim into the audit snapshot.
         result = service.publish_version(
             version_label=request.version_label,
-            published_by=request.published_by
+            published_by=_u.email,
         )
 
         if not result:
@@ -182,7 +187,7 @@ def publish_kb(request: PublishRequest, _u: UserContext = Depends(_kb_admin)):
 # ------------------------------------------------------------
 
 @router.post("/rollback/{version_label}")
-def rollback_kb(version_label: str, _u: UserContext = Depends(_kb_admin)):
+def rollback_kb(version_label: str, _u: UserContext = Depends(_policy_admin)):
 
     try:
 

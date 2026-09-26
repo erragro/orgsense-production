@@ -6,6 +6,10 @@ Stage 2: Validation Engine
 Responsibilities:
 - Re-validates all business logic checks against stage1 signals
 - Detects discrepancies between LLM decisions and deterministic rules
+- Applies Policy Studio rules (app.l4_agents.rule_engine) before the
+  safety checks: in RULE_ENFORCEMENT=enforce the first matching deterministic
+  rule sets the action and amount; in observe it is only recorded
+  (rule_decision) next to the actual outcome
 - Assigns automation_pathway using 3-bucket routing:
 
     AUTO_RESOLVED   — zero/non-monetary, high confidence, automation eligible, no fraud
@@ -28,6 +32,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 load_dotenv(PROJECT_ROOT / ".env")
+
+from app.l4_agents import rule_engine
 
 logger = logging.getLogger("stage2_validator")
 
@@ -72,6 +78,42 @@ def _load_action_meta(action_code: str) -> dict:
         return {"requires_escalation": False, "automation_eligible": True, "requires_refund": False}
 
 
+def _rule_amount(decision, ai_amount: float, order_value: float) -> float:
+    """
+    A rule's amount: the one it states, else the AI's for a refund action —
+    within the rule's cap and the order value. A non-refund action with no
+    stated amount pays nothing; it must not inherit the AI's refund.
+    """
+    refundable = _load_action_meta(decision.action_code).get("requires_refund", False)
+    if decision.refund_amount is None and not refundable:
+        return 0.0
+    return decision.amount(ai_amount, order_value or None)
+
+
+def _rule_record(mode: str, decision, ai_action: str, ai_amount: float, order_value: float) -> dict:
+    """What the rules decided (or would have), next to the AI's proposal."""
+    if decision is None:
+        return {"mode": mode, "matched": False, "applied": False, "agrees": None,
+                "ai_action": ai_action, "ai_amount": round(ai_amount, 2)}
+    applicable = bool(decision.action_code)
+    rule_amount = _rule_amount(decision, ai_amount, order_value) if applicable else None
+    return {
+        "mode": mode,
+        "matched": True,
+        "applied": mode == "enforce" and applicable,
+        "rule_id": decision.rule_id,
+        "rule_action": decision.action_code,
+        "rule_amount": rule_amount,
+        "rule_sets_amount": decision.refund_amount is not None or decision.max_refund is not None,
+        "evidence_required": decision.evidence_required,
+        "ai_action": ai_action,
+        "ai_amount": round(ai_amount, 2),
+        "agrees": applicable and decision.action_code == ai_action and abs(rule_amount - ai_amount) < 0.01,
+        "rules_considered": decision.considered,
+        "note": None if applicable else "Rule action is not in the action registry; not applied",
+    }
+
+
 def run(
     ticket_id: int,
     execution_id: str,
@@ -79,7 +121,12 @@ def run(
     stage1_result: dict,
     rules: list,
     fields: dict,
+    rule_mode: str | None = None,
 ) -> dict[str, Any]:
+    """
+    rule_mode overrides RULE_ENFORCEMENT (the simulator previews "enforce").
+    """
+    from app.config import settings
 
     order_ctx       = fields.get("order_context") or {}
     risk_ctx        = fields.get("risk_context") or {}
@@ -88,6 +135,26 @@ def run(
     order_value = float(order_ctx.get("order_value", 0) or 0)
     requested   = float(stage1_result.get("calculated_gratification", 0) or 0)
     auto_limit  = float(risk_ctx.get("auto_approval_limit", 0) or 0)
+
+    # ── Policy Studio rules ───────────────────────────────────────────────────
+    # Evaluated before every safety check below, so a rule can set the action
+    # and amount but can never bypass fraud zeroing, escalation or review.
+    mode = rule_mode or settings.rule_enforcement
+    ai_action = stage1_result.get("action_code", "REFUND_PARTIAL")
+    decision = rule_engine.decide(
+        rules or [], rule_engine.facts_from_pipeline(stage0_result, stage1_result, fields),
+    )
+    rule_decision = _rule_record(mode, decision, ai_action, requested, order_value)
+    effective_action = ai_action
+    evidence_review = False
+    if rule_decision["applied"]:
+        effective_action = decision.action_code
+        requested = rule_decision["rule_amount"]
+        evidence_review = decision.evidence_required
+
+    # Stage 0 could not place the ticket in the live taxonomy: no rule was
+    # written for it, so a person decides rather than the model alone.
+    issue_unmapped = stage0_result.get("taxonomy_status") == "unmapped"
 
     # Cap refund to order value
     final_refund = min(requested, order_value) if order_value else requested
@@ -106,9 +173,12 @@ def run(
         and fraud_score < 0.2                   # not a known fraud risk
         and greedy_pre == "NORMAL"              # no active fraud signals
         and requested > 0                       # there is a refund to approve
+        and not evidence_review                 # a deciding rule demands evidence review
+        and not issue_unmapped                  # no policy covers this problem
     ):
         return {
-            "final_action_code":         stage1_result.get("action_code", "REFUND_PARTIAL"),
+            "rule_decision":             rule_decision,
+            "final_action_code":         effective_action,
             "final_refund_amount":        min(requested, order_value) if order_value else requested,
             "validation_status":          "TIER_AUTO_APPROVED",
             "requires_human_review":      False,
@@ -138,7 +208,7 @@ def run(
         }
 
     # ── Pull signal flags from stage1 ────────────────────────────────────────
-    action_code            = stage1_result.get("action_code", "REFUND_PARTIAL")
+    action_code            = effective_action
     overall_confidence     = float(stage1_result.get("overall_confidence", 0.7) or 0.7)
     greedy_classification  = (stage1_result.get("greedy_classification") or "NORMAL").upper()
     fraud_segment          = (stage1_result.get("fraud_segment") or "NORMAL").upper()
@@ -186,8 +256,16 @@ def run(
     if requires_escalation:
         discrepancies.append(f"action_requires_escalation:{action_code}")
 
+    # Only an enforced rule changes reported discrepancies; observe mode must
+    # leave every output as it was and record the comparison separately.
+    if rule_decision["applied"] and rule_decision["agrees"] is False:
+        discrepancies.append(f"rule_decided:{rule_decision['rule_id']}:{ai_action}->{action_code}")
+
     if not automation_eligible:
         discrepancies.append(f"action_not_automation_eligible:{action_code}")
+
+    if issue_unmapped:
+        discrepancies.append(f"issue_not_in_taxonomy:{stage0_result.get('model_issue') or 'unknown'}")
 
     discrepancy_detected = len(discrepancies) > 0
     discrepancy_count    = len(discrepancies)
@@ -238,6 +316,8 @@ def run(
     ]
 
     hitl_triggers = [
+        evidence_review,                        # deciding rule requires evidence
+        issue_unmapped,                         # outside the live taxonomy
         final_refund > 0,
         requires_refund_flag,
         greedy_classification == "SUSPICIOUS" and final_refund > 0,
@@ -272,8 +352,13 @@ def run(
         reasoning_parts.append(f"discrepancies=[{', '.join(discrepancies)}]")
     if override_applied:
         reasoning_parts.append(f"override={override_reason}")
+    if rule_decision["matched"]:
+        reasoning_parts.append(
+            f"rule={rule_decision['rule_id']} ({'applied' if rule_decision['applied'] else mode})"
+        )
 
     return {
+        "rule_decision":            rule_decision,
         # ── Core output ───────────────────────────────────────────────────────
         "final_action_code":        action_code,
         "final_refund_amount":      final_refund,

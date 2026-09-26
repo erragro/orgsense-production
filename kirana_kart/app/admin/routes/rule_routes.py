@@ -12,6 +12,11 @@ Endpoints:
   DELETE /rules/{kb_id}/{rule_id}            → delete a rule
   GET    /rules/{kb_id}/action-codes         → available action codes (dropdown)
   GET    /rules/{kb_id}/validate             → run duplicate/conflict check (stub)
+
+Writes are governed by the Policy Studio lifecycle: a version awaiting
+approval or live cannot be edited, and editing a tested proposal returns it
+to RULE_EDIT (policy_lifecycle.open_for_editing). Direct edits to a live
+version previously changed customer decisions with no review at all.
 """
 
 from __future__ import annotations
@@ -22,12 +27,16 @@ from typing import Optional, Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from app.admin.db import engine
 from app.admin.routes.auth import UserContext, require_permission
+from app.admin.services import policy_knowledge_service as knowledge
+from app.admin.services import policy_lifecycle as lifecycle
+from app.admin.services.bpm_service import BPMService
+from app.admin.services.policy_lifecycle import LifecycleError
 
 logger = logging.getLogger("kirana_kart.rule_routes")
 
@@ -36,13 +45,15 @@ router = APIRouter(prefix="/rules", tags=["Rule Editor"])
 _kb_view  = require_permission("knowledgeBase", "view")
 _kb_edit  = require_permission("knowledgeBase", "edit")
 
+_bpm_service = BPMService(engine)
+
 
 # ============================================================
 # REQUEST MODELS
 # ============================================================
 
 class RuleCreate(BaseModel):
-    policy_version: str
+    policy_version: str = Field(min_length=1, max_length=50)
     rule_id: Optional[str] = None          # auto-generated if omitted
     module_name: str = "default"
     rule_type: str = "action"
@@ -64,6 +75,13 @@ class RuleCreate(BaseModel):
     action_payload: dict = {}
     deterministic: bool = True
     overrideable: bool = False
+
+    @field_validator("action_payload")
+    @classmethod
+    def _amounts(cls, v: dict) -> dict:
+        # Amounts the runtime applies when this rule decides a ticket.
+        from app.l4_agents.rule_engine import validate_payload
+        return validate_payload(v)
 
 
 class RuleUpdate(BaseModel):
@@ -87,6 +105,14 @@ class RuleUpdate(BaseModel):
     action_payload: Optional[dict] = None
     deterministic: Optional[bool] = None
     overrideable: Optional[bool] = None
+    # Why the reviewer changed the rule; kept with the AI-vs-human diff.
+    edit_reason: Optional[str] = Field(default=None, max_length=2000)
+
+    @field_validator("action_payload")
+    @classmethod
+    def _amounts(cls, v: Optional[dict]) -> Optional[dict]:
+        from app.l4_agents.rule_engine import validate_payload
+        return None if v is None else validate_payload(v)
 
 
 # ============================================================
@@ -94,20 +120,101 @@ class RuleUpdate(BaseModel):
 # ============================================================
 
 def _seed_training_sample(conn, kb_id: str, correction_type: str, input_data: dict, corrected: dict) -> None:
-    """Record every rule edit as a training sample for Model A."""
+    """
+    Record every rule edit as a training sample for Model A. Best effort, in
+    a savepoint: a failed insert must not abort the caller's transaction, or
+    COMMIT silently rolls back the rule change the user was told succeeded.
+    """
     try:
-        conn.execute(text("""
+        with conn.begin_nested():
+            conn.execute(text("""
             INSERT INTO kirana_kart.ml_training_samples
                 (model_name, kb_id, input_data, corrected_output, correction_type)
-            VALUES ('rule_extractor', :kb_id, :input::jsonb, :corrected::jsonb, :ctype)
-        """), {
-            "kb_id": kb_id,
-            "input": __import__("json").dumps(input_data),
-            "corrected": __import__("json").dumps(corrected),
-            "ctype": correction_type,
-        })
+            VALUES ('rule_extractor', :kb_id, CAST(:input AS jsonb), CAST(:corrected AS jsonb), :ctype)
+            """), {
+                "kb_id": kb_id,
+                "input": __import__("json").dumps(input_data, default=str),
+                "corrected": __import__("json").dumps(corrected, default=str),
+                "ctype": correction_type,
+            })
     except Exception:
         logger.warning("Failed to seed ml_training_samples — skipping", exc_info=True)
+
+
+_RULE_FIELDS = (
+    "module_name", "rule_type", "priority", "rule_scope", "issue_type_l1", "issue_type_l2",
+    "business_line", "customer_segment", "fraud_segment", "min_order_value", "max_order_value",
+    "min_repeat_count", "max_repeat_count", "sla_breach_required", "evidence_required",
+    "conditions", "action_id", "action_payload", "deterministic", "overrideable",
+)
+
+
+def _log_rule_change(conn, kb_id: str, version: str, before: dict, after: dict,
+                     edit_type: str, reason: Optional[str], user: UserContext) -> None:
+    """
+    Record a rule change against what the generator wrote for it, when it
+    did, so a correction reads 'AI said X, reviewer set Y' even after
+    several edits. Rules written by hand diff against their previous value.
+    """
+    generated = conn.execute(text("""
+        SELECT llm_output FROM kirana_kart.rule_edit_log
+        WHERE kb_id = :kb AND entity_id = :v AND stage = 'rule'
+          AND item_ref = :ref AND edit_type = 'proposed'
+        ORDER BY id DESC LIMIT 1
+    """), {"kb": kb_id, "v": version, "ref": before.get("rule_id")}).scalar() or {}
+    if isinstance(generated, str):
+        generated = __import__("json").loads(generated)
+    baseline = {**before, **{k: v for k, v in generated.items() if k in _RULE_FIELDS}}
+    changes = knowledge.field_changes(baseline, after, _RULE_FIELDS) if after else None
+    if edit_type == "edited" and not changes:
+        return
+    knowledge.log_edit(
+        conn, kb_id=kb_id, entity_id=version, stage="rule", item_ref=before.get("rule_id"),
+        edit_type=edit_type, business_line=before.get("business_line"),
+        llm_output=generated or None, user_output=after or None,
+        reason=(reason or "").strip() or None, actor_id=user.id, changes=changes,
+    )
+
+
+def _require_kb_access(user: UserContext, kb_id: str, required_role: str) -> None:
+    if user.is_super_admin:
+        return
+    if not _bpm_service.check_kb_access(kb_id=kb_id, user_id=user.id, required_role=required_role):
+        raise HTTPException(status_code=403, detail=f"You do not have {required_role} access to KB '{kb_id}'")
+
+
+def _guard_version_write(conn, kb_id: str, version: str, user: UserContext, change: str) -> None:
+    """Refuse edits to versions under approval or live; invalidate stale test evidence."""
+    try:
+        instance = lifecycle.load_proposal(conn, kb_id, version, lock=True)
+    except LifecycleError as exc:
+        if exc.status_code != 404:
+            raise
+        instance = None
+    if instance:
+        lifecycle.open_for_editing(conn, instance, user, change)
+        return
+    # A version outside Policy Studio: never edit what is or was live.
+    active, shadow = lifecycle.runtime_versions(conn)
+    published = conn.execute(text("""
+        SELECT 1 FROM kirana_kart.knowledge_base_versions WHERE version_label = :v
+        UNION ALL
+        SELECT 1 FROM kirana_kart.policy_versions WHERE policy_version = :v AND is_active
+    """), {"v": version}).first()
+    if published or version in (active, shadow):
+        raise LifecycleError(409, (
+            f"Version '{version}' is published or in live use and cannot be edited. "
+            "Create a new policy change instead."
+        ))
+
+
+def _rule_version(conn, kb_id: str, rule_db_id: int) -> str:
+    version = conn.execute(text("""
+        SELECT policy_version FROM kirana_kart.rule_registry WHERE id = :id AND kb_id = :kb_id
+    """), {"id": rule_db_id, "kb_id": kb_id}).scalar()
+    if version is None:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    return version
 
 
 # ============================================================
@@ -121,6 +228,7 @@ def list_rules(
     _u: UserContext = Depends(_kb_view),
 ):
     """Return all rules for a specific KB + policy version."""
+    _require_kb_access(_u, kb_id, "view")
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
@@ -149,9 +257,15 @@ def list_rules(
 def create_rule(kb_id: str, body: RuleCreate, u: UserContext = Depends(_kb_edit)):
     """Add a new rule to a policy version. Seeds training sample."""
     import json
+    _require_kb_access(u, kb_id, "edit")
     try:
         rule_id = body.rule_id or f"R-{uuid.uuid4().hex[:8].upper()}"
         with engine.begin() as conn:
+            _guard_version_write(conn, kb_id, body.policy_version, u, f"Rule {rule_id} added")
+            if not conn.execute(text("""
+                SELECT 1 FROM kirana_kart.master_action_codes WHERE id = :id
+            """), {"id": body.action_id}).scalar():
+                raise HTTPException(status_code=400, detail="Unknown action")
             row = conn.execute(text("""
                 INSERT INTO kirana_kart.rule_registry (
                     kb_id, rule_id, policy_version, module_name, rule_type, priority,
@@ -165,8 +279,8 @@ def create_rule(kb_id: str, body: RuleCreate, u: UserContext = Depends(_kb_edit)
                     :priority, :rule_scope, :issue_type_l1, :issue_type_l2,
                     :business_line, :customer_segment, :fraud_segment,
                     :min_order_value, :max_order_value, :min_repeat_count, :max_repeat_count,
-                    :sla_breach_required, :evidence_required, :conditions::jsonb,
-                    :action_id, :action_payload::jsonb, :deterministic, :overrideable
+                    :sla_breach_required, :evidence_required, CAST(:conditions AS jsonb),
+                    :action_id, CAST(:action_payload AS jsonb), :deterministic, :overrideable
                 )
                 RETURNING id, rule_id
             """), {
@@ -201,8 +315,17 @@ def create_rule(kb_id: str, body: RuleCreate, u: UserContext = Depends(_kb_edit)
                 {"policy_version": body.policy_version},
                 body.model_dump(),
             )
+            knowledge.log_edit(
+                conn, kb_id=kb_id, entity_id=body.policy_version, stage="rule", item_ref=rule_id,
+                edit_type="manual_add", business_line=body.business_line,
+                user_output=body.model_dump(), actor_id=u.id,
+            )
 
         return {"id": row["id"], "rule_id": row["rule_id"]}
+    except LifecycleError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("create_rule failed")
         raise HTTPException(status_code=500, detail="An internal error occurred. See server logs for details.")
@@ -217,8 +340,18 @@ def update_rule(
 ):
     """Partial update of a rule. Only supplied fields are changed. Seeds training sample."""
     import json
+    _require_kb_access(u, kb_id, "edit")
     try:
-        updates = body.model_dump(exclude_none=True)
+        # Fields sent as null are cleared (e.g. removing an order-value bound);
+        # exclude_none used to drop them, so a cleared bound silently stayed.
+        # Columns that cannot be null are only ever changed, never cleared.
+        updates = body.model_dump(exclude_unset=True)
+        reason = updates.pop("edit_reason", None)
+        for required in ("module_name", "rule_type", "action_id", "priority", "rule_scope",
+                         "issue_type_l1", "conditions", "action_payload", "deterministic",
+                         "overrideable", "sla_breach_required", "evidence_required"):
+            if required in updates and updates[required] is None:
+                updates.pop(required)
         if not updates:
             raise HTTPException(status_code=400, detail="No fields to update")
 
@@ -227,7 +360,8 @@ def update_rule(
         params: dict[str, Any] = {"id": rule_db_id, "kb_id": kb_id}
         for key, val in updates.items():
             if key in ("conditions", "action_payload"):
-                set_parts.append(f"{key} = :{key}::jsonb")
+                # CAST, not "::jsonb": SQLAlchemy does not bind ":x::jsonb".
+                set_parts.append(f"{key} = CAST(:{key} AS jsonb)")
                 params[key] = json.dumps(val)
             else:
                 set_parts.append(f"{key} = :{key}")
@@ -236,6 +370,15 @@ def update_rule(
         set_clause = ", ".join(set_parts)
 
         with engine.begin() as conn:
+            version = _rule_version(conn, kb_id, rule_db_id)
+            _guard_version_write(conn, kb_id, version, u, f"Rule {rule_db_id} edited")
+            if "action_id" in updates and not conn.execute(text("""
+                SELECT 1 FROM kirana_kart.master_action_codes WHERE id = :id
+            """), {"id": updates["action_id"]}).scalar():
+                raise HTTPException(status_code=400, detail="Unknown action")
+            before = conn.execute(text("""
+                SELECT * FROM kirana_kart.rule_registry WHERE id = :id AND kb_id = :kb_id
+            """), {"id": rule_db_id, "kb_id": kb_id}).mappings().first()
             result = conn.execute(text(f"""
                 UPDATE kirana_kart.rule_registry
                 SET {set_clause}
@@ -247,8 +390,11 @@ def update_rule(
                 raise HTTPException(status_code=404, detail="Rule not found")
 
             _seed_training_sample(conn, kb_id, "edit", {"rule_db_id": rule_db_id}, updates)
+            _log_rule_change(conn, kb_id, version, dict(before), updates, "edited", reason, u)
 
         return {"id": row["id"], "rule_id": row["rule_id"]}
+    except LifecycleError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
     except HTTPException:
         raise
     except Exception as e:
@@ -260,20 +406,27 @@ def update_rule(
 def delete_rule(
     kb_id: str,
     rule_db_id: int,
+    reason: Optional[str] = Query(default=None, max_length=2000),
     u: UserContext = Depends(_kb_edit),
 ):
     """Delete a rule. Seeds a deletion training sample."""
+    _require_kb_access(u, kb_id, "edit")
     try:
         with engine.begin() as conn:
+            version = _rule_version(conn, kb_id, rule_db_id)
+            _guard_version_write(conn, kb_id, version, u, f"Rule {rule_db_id} removed")
             result = conn.execute(text("""
                 DELETE FROM kirana_kart.rule_registry
                 WHERE id = :id AND kb_id = :kb_id
-                RETURNING rule_id
+                RETURNING *
             """), {"id": rule_db_id, "kb_id": kb_id})
             row = result.mappings().first()
             if not row:
                 raise HTTPException(status_code=404, detail="Rule not found")
             _seed_training_sample(conn, kb_id, "delete", {"rule_db_id": rule_db_id}, {})
+            _log_rule_change(conn, kb_id, version, dict(row), {}, "rejected", reason, u)
+    except LifecycleError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
     except HTTPException:
         raise
     except Exception as e:
@@ -284,13 +437,17 @@ def delete_rule(
 @router.get("/{kb_id}/action-codes")
 def list_action_codes(kb_id: str, _u: UserContext = Depends(_kb_view)):
     """Return all master action codes for dropdowns."""
+    # The previous query selected action_category, requires_approval,
+    # is_reversible and severity_level — columns master_action_codes does not
+    # have — so every rule editor's action dropdown failed with a 500.
+    _require_kb_access(_u, kb_id, "view")
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT id, action_code_id, action_name, action_category,
-                       requires_approval, is_reversible, severity_level
+                SELECT id, action_code_id, action_name, action_description,
+                       requires_refund, requires_escalation, automation_eligible
                 FROM kirana_kart.master_action_codes
-                ORDER BY action_category, action_name
+                ORDER BY action_name, action_code_id
             """)).mappings().all()
         return jsonable_encoder([dict(r) for r in rows])
     except Exception as e:
@@ -320,10 +477,13 @@ async def import_rules_csv(
     import io
     import json
 
+    _require_kb_access(u, kb_id, "edit")
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="File must be a .csv")
 
-    raw = await file.read()
+    raw = await file.read(5 * 1024 * 1024 + 1)
+    if len(raw) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="CSV is larger than 5 MB")
     try:
         text_content = raw.decode("utf-8-sig")  # strip BOM if present
     except UnicodeDecodeError:
@@ -340,8 +500,9 @@ async def import_rules_csv(
                 SELECT id, action_code_id FROM kirana_kart.master_action_codes
             """)).mappings().all()
         action_code_map = {r["action_code_id"].upper(): r["id"] for r in ac_rows}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load action codes: {e}")
+    except Exception:
+        logger.exception("import_rules_csv: loading action codes failed")
+        raise HTTPException(status_code=500, detail="Failed to load action codes")
 
     imported = 0
     errors: list[dict] = []
@@ -372,6 +533,12 @@ async def import_rules_csv(
     rows = list(reader)
     if not rows:
         raise HTTPException(status_code=400, detail="CSV has headers but no data rows")
+
+    try:
+        with engine.begin() as conn:
+            _guard_version_write(conn, kb_id, version_label, u, "Rules imported from CSV")
+    except LifecycleError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
 
     with engine.begin() as conn:
         for row_num, row in enumerate(rows, start=2):  # row 1 = header
@@ -437,7 +604,7 @@ async def import_rules_csv(
                 if result.rowcount:
                     imported += 1
                     _seed_training_sample(
-                        conn, kb_id, "csv_import",
+                        conn, kb_id, "manual_add",  # correction_type CHECK has no csv_import
                         {"policy_version": version_label, "row": row_num},
                         {"rule_id": rule_id, "action_code_id": raw_code, "issue_type_l1": issue_type_l1},
                     )
@@ -464,6 +631,7 @@ def validate_rules(
     Runs all rules for the version through batch_check().
     Returns immediately — no training needed (uses pre-trained MiniLM).
     """
+    _require_kb_access(_u, kb_id, "view")
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
@@ -503,4 +671,4 @@ def validate_rules(
 
     except Exception as e:
         logger.exception("validate_rules failed")
-        return {"warnings": [], "conflicts": [], "duplicates": [], "model_status": "error", "error": str(e)}
+        return {"warnings": [], "conflicts": [], "duplicates": [], "model_status": "error"}

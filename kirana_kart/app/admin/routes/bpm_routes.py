@@ -15,37 +15,50 @@ Endpoints:
     GET    /bpm/{kb_id}/instances               → list instances (filter by stage)
     POST   /bpm/{kb_id}/instances               → create instance
     GET    /bpm/{kb_id}/instances/{id}          → get instance detail
-    POST   /bpm/{kb_id}/instances/{id}/transition → advance stage
+    POST   /bpm/{kb_id}/instances/{id}/transition → reopen / manual stage change
     GET    /bpm/{kb_id}/instances/{id}/trail    → audit trail
     GET    /bpm/{kb_id}/instances/{id}/gates    → gate results
     GET    /bpm/{kb_id}/instances/{id}/approvals → pending approvals
 
   Approvals:
-    POST   /bpm/approvals/{approval_id}/approve → approve
+    POST   /bpm/approvals/{approval_id}/approve → approve (activates a policy version)
     POST   /bpm/approvals/{approval_id}/reject  → reject
     POST   /bpm/{kb_id}/instances/{id}/request-approval → create approval request
+
+  Policy Studio (kb_version proposals; see services/policy_lifecycle.py):
+    POST   /bpm/kb/{kb_id}/upload               → SOP upload → DRAFT proposal
+    POST   /bpm/kb/{kb_id}/extract-taxonomy     → stage 1 analysis
+    POST   /bpm/kb/{kb_id}/extract-actions      → stage 2 analysis
+    POST   /bpm/kb/{kb_id}/generate-rules       → stage 3 → RULE_EDIT
+    POST   /bpm/kb/{kb_id}/simulate             → sample replay gate
+    POST   /bpm/kb/{kb_id}/submit               → request approval
+    GET    /bpm/kb/{kb_id}/proposals/{entity_id}/readiness
+    POST   /bpm/kb/{kb_id}/publish              → approve + activate
+
+Every instance lookup is scoped to the kb_id in the URL: access is checked
+against that KB, so an instance from another KB must not be reachable through
+it.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from fastapi.encoders import jsonable_encoder
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from app.admin.db import engine
 from app.admin.routes.auth import UserContext, require_permission
+from app.admin.services import policy_knowledge_service as knowledge
+from app.admin.services import policy_lifecycle as lifecycle
 from app.admin.services.bpm_service import BPMService
+from app.admin.services.policy_lifecycle import LifecycleError, SIMULATION_GATE_THRESHOLD  # noqa: F401
 
 logger = logging.getLogger("kirana_kart.bpm_routes")
-
-# Simulation gate: the share of decisions that must stay unchanged for a
-# candidate policy to pass. Below this, the change is large enough that a
-# human should look at the diff before it goes live.
-SIMULATION_GATE_THRESHOLD = 0.80
 
 router = APIRouter(prefix="/bpm", tags=["BPM"])
 
@@ -56,6 +69,13 @@ _policy_admin = require_permission("policy", "admin")
 _sys_admin = require_permission("system", "admin")
 
 _bpm_service = BPMService(engine)
+
+# The wizard advertises this limit; it is enforced here, before conversion.
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+# entity_id becomes kb_runtime_config.active_version / kb_vector_jobs.version_label,
+# both VARCHAR(50). "<kb_id>-<10 hex>" must fit.
+MAX_KB_ID_LENGTH = 32
+MAX_ENTITY_ID_LENGTH = 50
 
 
 # ============================================================
@@ -73,6 +93,8 @@ class CreateKBRequest(BaseModel):
         v = v.strip().lower()
         if not v or not v.replace("_", "").replace("-", "").isalnum():
             raise ValueError("kb_id must be alphanumeric (underscores/hyphens allowed)")
+        if len(v) > MAX_KB_ID_LENGTH:
+            raise ValueError(f"kb_id must be at most {MAX_KB_ID_LENGTH} characters")
         return v
 
 
@@ -109,11 +131,24 @@ class TransitionRequest(BaseModel):
 
 
 class RequestApprovalRequest(BaseModel):
-    stage: str
+    stage: str = "PENDING_APPROVAL"
+    justification: Optional[str] = Field(default=None, max_length=2000)
 
 
 class ReviewApprovalRequest(BaseModel):
-    notes: Optional[str] = None
+    notes: Optional[str] = Field(default=None, max_length=2000)
+
+
+class EntityRequest(BaseModel):
+    entity_id: str = Field(min_length=1, max_length=MAX_ENTITY_ID_LENGTH)
+
+
+class SubmitRequest(EntityRequest):
+    justification: Optional[str] = Field(default=None, max_length=2000)
+
+
+class PublishRequest(EntityRequest):
+    notes: Optional[str] = Field(default=None, max_length=2000)
 
 
 # ============================================================
@@ -138,6 +173,32 @@ def _require_kb_access(
             status_code=403,
             detail=f"You do not have {required_role} access to KB '{kb_id}'",
         )
+
+
+def _has_policy_admin(user: UserContext) -> bool:
+    return bool(user.is_super_admin or (user.permissions or {}).get("policy", {}).get("admin"))
+
+
+def _entity_id(body: dict | EntityRequest) -> str:
+    entity_id = body.entity_id if isinstance(body, EntityRequest) else (body or {}).get("entity_id", "")
+    if not entity_id:
+        raise HTTPException(status_code=400, detail="entity_id required")
+    return entity_id
+
+
+@contextmanager
+def _lifecycle_txn():
+    """One transaction per lifecycle operation; refusals become HTTP errors and roll back."""
+    try:
+        with engine.begin() as conn:
+            yield conn
+    except LifecycleError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+
+def _scoped_instance(kb_id: str, instance_id: int) -> dict:
+    with _lifecycle_txn() as conn:
+        return lifecycle.load_instance(conn, kb_id, instance_id)
 
 
 # ============================================================
@@ -169,9 +230,9 @@ def create_kb(request: CreateKBRequest, u: UserContext = Depends(_sys_admin)):
             created_by_id=u.id,
         )
         return jsonable_encoder(kb)
-    except Exception as e:
+    except Exception:
         logger.exception("create_kb failed")
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail="Could not create the knowledge base. The ID may already exist.")
 
 
 @router.get("/kbs/{kb_id}/members")
@@ -201,9 +262,9 @@ def set_kb_member(
             granted_by_id=u.id,
         )
         return {"status": "ok", "kb_id": kb_id, "user_id": request.user_id, "role": request.role}
-    except Exception as e:
+    except Exception:
         logger.exception("set_kb_member failed")
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail="Could not update the member role")
 
 
 @router.delete("/kbs/{kb_id}/members/{user_id}")
@@ -213,9 +274,9 @@ def remove_kb_member(kb_id: str, user_id: int, u: UserContext = Depends(_kb_admi
     try:
         _bpm_service.remove_kb_member(kb_id=kb_id, user_id=user_id)
         return {"status": "removed", "kb_id": kb_id, "user_id": user_id}
-    except Exception as e:
+    except Exception:
         logger.exception("remove_kb_member failed")
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail="Could not remove the member")
 
 
 # ============================================================
@@ -275,13 +336,7 @@ def create_instance(
 def get_instance(kb_id: str, instance_id: int, u: UserContext = Depends(_kb_view)):
     """Get full detail of a BPM instance."""
     _require_kb_access(u, kb_id, "view")
-    try:
-        return jsonable_encoder(_bpm_service.get_instance(instance_id))
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception:
-        logger.exception("get_instance failed")
-        raise HTTPException(status_code=500, detail="Failed to get instance")
+    return jsonable_encoder(_scoped_instance(kb_id, instance_id))
 
 
 @router.post("/{kb_id}/instances/{instance_id}/transition")
@@ -291,29 +346,43 @@ def transition_instance(
     request: TransitionRequest,
     u: UserContext = Depends(_kb_edit),
 ):
-    """Advance a BPM instance to the next stage."""
+    """
+    Manual stage change.
+
+    Policy proposals advance only through the work each stage describes
+    (analysis, sample replay, approval), so for them this endpoint can only
+    reopen a proposal for editing. No process may be moved to ACTIVE here:
+    that previously showed a version as live that the runtime never served.
+    """
     _require_kb_access(u, kb_id, "edit")
-    try:
-        instance = _bpm_service.transition(
-            instance_id=instance_id,
-            to_stage=request.to_stage,
-            actor_id=u.id,
-            actor_name=u.email,
-            notes=request.notes,
-            transition_data=request.transition_data,
-        )
-        return jsonable_encoder(instance)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception:
-        logger.exception("transition failed")
-        raise HTTPException(status_code=500, detail="Failed to transition instance")
+    with _lifecycle_txn() as conn:
+        instance = lifecycle.load_instance(conn, kb_id, instance_id, lock=True)
+        if request.to_stage == "ACTIVE":
+            raise LifecycleError(409, "Activation requires an approved request, not a stage change.")
+        if instance["entity_type"] == "kb_version":
+            if request.to_stage != "RULE_EDIT":
+                raise LifecycleError(409, (
+                    "Policy proposals advance through analysis, testing and approval. "
+                    "Only reopening for editing (RULE_EDIT) is a manual step."
+                ))
+            lifecycle.open_for_editing(conn, instance, u, request.notes or "Reopened for editing")
+        else:
+            try:
+                BPMService.transition_on(
+                    conn, instance_id, request.to_stage,
+                    actor_id=u.id, actor_name=u.email,
+                    notes=request.notes, transition_data=request.transition_data,
+                )
+            except ValueError as e:
+                raise LifecycleError(400, str(e))
+    return jsonable_encoder(_bpm_service.get_instance(instance_id))
 
 
 @router.get("/{kb_id}/instances/{instance_id}/trail")
 def get_audit_trail(kb_id: str, instance_id: int, u: UserContext = Depends(_kb_view)):
     """Get the full stage transition audit trail for an instance."""
     _require_kb_access(u, kb_id, "view")
+    _scoped_instance(kb_id, instance_id)
     try:
         return jsonable_encoder(_bpm_service.get_audit_trail(instance_id))
     except Exception:
@@ -325,6 +394,7 @@ def get_audit_trail(kb_id: str, instance_id: int, u: UserContext = Depends(_kb_v
 def get_gate_results(kb_id: str, instance_id: int, u: UserContext = Depends(_kb_view)):
     """Get simulation/shadow gate results for an instance."""
     _require_kb_access(u, kb_id, "view")
+    _scoped_instance(kb_id, instance_id)
     try:
         return jsonable_encoder(_bpm_service.get_gate_results(instance_id))
     except Exception:
@@ -336,6 +406,7 @@ def get_gate_results(kb_id: str, instance_id: int, u: UserContext = Depends(_kb_
 def get_pending_approvals(kb_id: str, instance_id: int, u: UserContext = Depends(_kb_view)):
     """Get pending approvals for an instance."""
     _require_kb_access(u, kb_id, "view")
+    _scoped_instance(kb_id, instance_id)
     try:
         return jsonable_encoder(_bpm_service.get_pending_approvals(instance_id))
     except Exception:
@@ -352,16 +423,19 @@ def request_approval(
 ):
     """Create a pending approval request for an instance stage."""
     _require_kb_access(u, kb_id, "edit")
+    with _lifecycle_txn() as conn:
+        instance = lifecycle.load_instance(conn, kb_id, instance_id)
+        if instance["entity_type"] == "kb_version":
+            return jsonable_encoder(lifecycle.submit_for_approval(
+                conn, kb_id, instance["entity_id"], u, request.justification,
+            ))
     try:
-        approval = _bpm_service.request_approval(
+        return jsonable_encoder(_bpm_service.request_approval(
             instance_id=instance_id,
             stage=request.stage,
             requested_by_id=u.id,
             requested_by=u.email,
-        )
-        return jsonable_encoder(approval)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        ))
     except Exception:
         logger.exception("request_approval failed")
         raise HTTPException(status_code=500, detail="Failed to request approval")
@@ -371,21 +445,54 @@ def request_approval(
 # APPROVALS
 # ============================================================
 
+def _approval_instance(approval_id: int) -> dict:
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT a.id AS approval_id, i.id, i.kb_id, i.entity_type
+            FROM kirana_kart.bpm_approvals a
+            JOIN kirana_kart.bpm_process_instances i ON i.id = a.instance_id
+            WHERE a.id = :id
+        """), {"id": approval_id}).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Approval not found")
+    return dict(row)
+
+
+def _authorise_decision(u: UserContext, target: dict) -> None:
+    """Deciding needs admin on the approval's own KB; policy versions also need policy.admin."""
+    _require_kb_access(u, target["kb_id"], "admin")
+    if target["entity_type"] == "kb_version" and not _has_policy_admin(u):
+        raise HTTPException(status_code=403, detail="Permission denied: policy.admin required")
+
+
 @router.post("/approvals/{approval_id}/approve")
 def approve_request(
     approval_id: int,
     request: ReviewApprovalRequest,
     u: UserContext = Depends(_kb_admin),
 ):
-    """Approve a pending approval (kb.admin or super admin)."""
+    """
+    Approve a pending approval. For a policy version this activates it —
+    approval that only moved the stage marker left the runtime serving the
+    previous policy while the board said ACTIVE.
+    """
+    from app.config import settings
+
+    target = _approval_instance(approval_id)
+    _authorise_decision(u, target)
+    if target["entity_type"] == "kb_version":
+        with _lifecycle_txn() as conn:
+            return jsonable_encoder(lifecycle.approve_and_activate(
+                conn, engine, target["kb_id"], target["id"], u,
+                notes=request.notes, approval_id=approval_id,
+                require_separate_approver=settings.policy_require_separate_approver,
+            ))
     try:
-        result = _bpm_service.approve(
-            approval_id=approval_id,
-            reviewer_id=u.id,
-            reviewer_name=u.email,
-            notes=request.notes,
-        )
-        return jsonable_encoder(result)
+        return jsonable_encoder(_bpm_service.approve(
+            approval_id=approval_id, reviewer_id=u.id,
+            reviewer_name=u.email, notes=request.notes,
+        ))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
@@ -400,14 +507,18 @@ def reject_request(
     u: UserContext = Depends(_kb_admin),
 ):
     """Reject a pending approval."""
+    target = _approval_instance(approval_id)
+    _authorise_decision(u, target)
+    if target["entity_type"] == "kb_version":
+        with _lifecycle_txn() as conn:
+            return jsonable_encoder(lifecycle.reject_proposal(
+                conn, target["kb_id"], target["id"], u, request.notes, approval_id=approval_id,
+            ))
     try:
-        result = _bpm_service.reject(
-            approval_id=approval_id,
-            reviewer_id=u.id,
-            reviewer_name=u.email,
-            notes=request.notes,
-        )
-        return jsonable_encoder(result)
+        return jsonable_encoder(_bpm_service.reject(
+            approval_id=approval_id, reviewer_id=u.id,
+            reviewer_name=u.email, notes=request.notes,
+        ))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
@@ -417,8 +528,17 @@ def reject_request(
 
 # ============================================================
 # MULTIPART FILE UPLOAD (for VersionWizard frontend)
-# Stores raw content in knowledge_base_raw_uploads via ingest service.
 # ============================================================
+
+async def _read_limited(file: UploadFile, limit: int) -> bytes:
+    chunks, size = [], 0
+    while chunk := await file.read(1024 * 1024):
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(status_code=413, detail=f"File is larger than {limit // (1024 * 1024)} MB")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
 
 @router.post("/kb/{kb_id}/upload")
 async def upload_document_file(
@@ -427,16 +547,19 @@ async def upload_document_file(
     change_name: str = Form(default="", max_length=160),
     business_outcome: str = Form(default="", max_length=2000),
     affected_scope: str = Form(default="", max_length=1000),
+    business_line: str = Form(default="", max_length=60),
     u: UserContext = Depends(_kb_edit),
 ):
     """
     Accept a multipart file upload (PDF/DOCX/MD/TXT/CSV).
-    Converts to markdown, stores in knowledge_base_raw_uploads,
-    creates a BPM instance in DRAFT stage, returns entity_id.
+    Converts to markdown, stores in knowledge_base_raw_uploads and creates
+    the DRAFT proposal in the same transaction, returns entity_id.
     """
     import base64
     import uuid
     from sqlalchemy import text
+
+    _require_kb_access(u, kb_id, "edit")
 
     ALLOWED_FORMATS = {"pdf", "docx", "md", "markdown", "txt", "csv"}
 
@@ -445,14 +568,23 @@ async def upload_document_file(
     if ext not in ALLOWED_FORMATS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file format '.{ext}'. Allowed: {', '.join(ALLOWED_FORMATS)}",
+            detail=f"Unsupported file format '.{ext}'. Allowed: {', '.join(sorted(ALLOWED_FORMATS))}",
         )
 
     try:
-        raw_bytes = await file.read()
-        if not raw_bytes:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        line = knowledge.normalise_business_line(business_line)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
+    entity_id = f"{kb_id}-{uuid.uuid4().hex[:10]}"
+    if len(entity_id) > MAX_ENTITY_ID_LENGTH:
+        raise HTTPException(status_code=400, detail="Knowledge base ID is too long for policy versions")
+
+    raw_bytes = await _read_limited(file, MAX_UPLOAD_BYTES)
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    try:
         # For binary formats (PDF, DOCX) encode as base64 for the MarkdownConverter
         if ext in ("pdf", "docx"):
             raw_content = base64.b64encode(raw_bytes).decode("ascii")
@@ -460,13 +592,21 @@ async def upload_document_file(
             raw_content = raw_bytes.decode("utf-8", errors="replace")
 
         from app.l1_ingestion.kb_registry.markdown_converter import MarkdownConverter
-        converter = MarkdownConverter()
-        markdown_content = converter.convert(raw_content, ext)
+        markdown_content = MarkdownConverter().convert(raw_content, ext)
+    except Exception:
+        logger.exception("upload conversion failed")
+        raise HTTPException(status_code=400, detail="The document could not be read. Check the file and try again.")
 
-        entity_id = f"{kb_id}-{uuid.uuid4().hex[:10]}"
-        version_label = entity_id
+    if not (markdown_content or "").strip():
+        raise HTTPException(status_code=400, detail="No readable text was found in this document")
 
+    try:
         with engine.begin() as conn:
+            if not conn.execute(text("""
+                SELECT 1 FROM kirana_kart.knowledge_bases WHERE kb_id = :kb_id AND is_active = TRUE
+            """), {"kb_id": kb_id}).scalar():
+                raise HTTPException(status_code=404, detail="Knowledge base not found")
+
             conn.execute(text("""
                 INSERT INTO kirana_kart.knowledge_base_raw_uploads (
                     document_id, original_filename, original_format,
@@ -486,37 +626,37 @@ async def upload_document_file(
                 "raw": raw_content if ext not in ("pdf", "docx") else "[binary]",
                 "md": markdown_content,
                 "by": u.email,
-                "version": version_label,
+                "version": entity_id,
                 "kb_id": kb_id,
             })
 
-        # Create BPM instance in DRAFT stage
-        instance = _bpm_service.create_instance(
-            kb_id=kb_id,
-            process_name="kb_policy_lifecycle",
-            entity_id=entity_id,
-            entity_type="kb_version",
-            created_by_id=u.id,
-            created_by_name=u.email,
-            metadata={"business_brief": {
-                "name": change_name.strip() or filename,
-                "outcome": business_outcome.strip(),
-                "scope": affected_scope.strip(),
-            }},
-        )
-
-        return {
-            "entity_id": entity_id,
-            "filename": filename,
-            "upload_id": entity_id,
-            "bpm_instance_id": instance["id"],
-        }
-
+            instance = _bpm_service.create_instance(
+                kb_id=kb_id,
+                process_name="kb_policy_lifecycle",
+                entity_id=entity_id,
+                entity_type="kb_version",
+                created_by_id=u.id,
+                created_by_name=u.email,
+                metadata={"business_brief": {
+                    "name": change_name.strip() or filename,
+                    "outcome": business_outcome.strip(),
+                    "scope": affected_scope.strip(),
+                }, "business_line": line},
+                conn=conn,
+            )
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         logger.exception("upload_document_file failed")
         raise HTTPException(status_code=500, detail="An internal error occurred. See server logs for details.")
+
+    return {
+        "entity_id": entity_id,
+        "filename": filename,
+        "upload_id": entity_id,
+        "bpm_instance_id": instance["id"],
+        "business_line": line,
+    }
 
 
 @router.post("/kb/{kb_id}/simulate")
@@ -526,226 +666,138 @@ def simulate_version(
     u: UserContext = Depends(_kb_edit),
 ):
     """
-    Run the impact simulation gate for a candidate policy version.
+    Run the sample replay gate for a candidate policy version.
 
-    This used to be a stub that returned a hardcoded unchanged_rate of 0.94
-    whenever any rule existed, which meant the gate passed unconditionally and
-    the reviewer was shown a fabricated number. It now runs the real
-    comparison in PolicySimulationService.run_simulation — replaying the
-    sample ticket set against the candidate rules and the currently active
-    baseline, and counting decisions that change.
+    Replays the saved sample tickets against the candidate rules and the
+    currently active baseline, records the result as the proposal's
+    simulation gate and advances it: within threshold (or with no live
+    policy to compare against) → SHADOW_GATE, otherwise SIMULATION_FAILED.
 
-    When the simulation genuinely cannot run (no baseline, no rules, no sample
-    tickets) the response says so with status="unavailable" and carries no
-    metrics. It never invents a rate: a governance gate that guesses is worse
-    than one that admits it has nothing to report.
+    When the replay genuinely cannot run (no rules, no sample tickets,
+    unresolved review items) the response says so with status="unavailable",
+    carries no metrics and leaves the stage unchanged. It never invents a rate.
     """
-    from sqlalchemy import text
     from app.l45_ml_platform.simulation.policy_simulation_service import (
         PolicySimulationService,
     )
 
-    _require_kb_access(u, kb_id, "admin")
-    entity_id = body.get("entity_id", "")
-    if not entity_id:
-        raise HTTPException(status_code=400, detail="entity_id required")
+    entity_id = _entity_id(body)
     _require_kb_access(u, kb_id, "edit")
+    with _lifecycle_txn() as conn:
+        result = lifecycle.run_simulation_gate(
+            conn, kb_id, entity_id, u, PolicySimulationService(engine),
+        )
+    return jsonable_encoder(result)
 
-    def _unavailable(reason: str) -> dict:
-        logger.info("Simulation gate unavailable for %s: %s", entity_id, reason)
-        return {
-            "status": "unavailable",
-            "passed": None,
-            "reason": reason,
-            "metrics": None,
-        }
+
+@router.post("/kb/{kb_id}/submit")
+def submit_for_approval(
+    kb_id: str,
+    body: SubmitRequest,
+    u: UserContext = Depends(_kb_edit),
+):
+    """
+    Request approval for a tested proposal. Freezes its rules as a compiled
+    version and queues the runtime preparation (vectorization) an approver
+    waits on. A proposal whose replay exceeded the change threshold needs a
+    written justification.
+    """
+    _require_kb_access(u, kb_id, "edit")
+    with _lifecycle_txn() as conn:
+        result = lifecycle.submit_for_approval(conn, kb_id, _entity_id(body), u, body.justification)
+    return jsonable_encoder(result)
+
+
+@router.get("/kb/{kb_id}/proposals/{entity_id}/readiness")
+def proposal_readiness(kb_id: str, entity_id: str, u: UserContext = Depends(_kb_view)):
+    """Review, preparation and approval state an approver needs before activating."""
+    _require_kb_access(u, kb_id, "view")
+    with _lifecycle_txn() as conn:
+        return jsonable_encoder(lifecycle.readiness(conn, kb_id, entity_id))
+
+
+_policy_view = require_permission("policy", "view")
+
+
+@router.get("/rule-decisions/summary")
+def rule_decision_summary(
+    days: int = Query(7, ge=1, le=90),
+    u: UserContext = Depends(_policy_view),
+):
+    """
+    How Policy Studio rules took part in recent live decisions. In observe
+    mode this is the evidence for switching RULE_ENFORCEMENT to enforce: how
+    often a rule matched, and how often it would have changed the outcome.
+    """
+    from sqlalchemy import text
+    from app.config import settings
 
     with engine.connect() as conn:
-        rule_count = conn.execute(text("""
-            SELECT COUNT(*) FROM kirana_kart.rule_registry
-            WHERE kb_id = :kb_id AND policy_version = :version
-        """), {"kb_id": kb_id, "version": entity_id}).scalar() or 0
+        totals = conn.execute(text("""
+            SELECT COUNT(*)                                                     AS evaluated,
+                   COUNT(*) FILTER (WHERE (rule_decision->>'matched')::boolean) AS matched,
+                   COUNT(*) FILTER (WHERE (rule_decision->>'applied')::boolean) AS applied,
+                   COUNT(*) FILTER (WHERE (rule_decision->>'matched')::boolean
+                                      AND NOT COALESCE((rule_decision->>'agrees')::boolean, TRUE))
+                                                                                AS differs,
+                   MAX(created_at)                                              AS last_evaluated_at
+            FROM kirana_kart.llm_output_3
+            WHERE rule_decision IS NOT NULL
+              AND created_at >= NOW() - make_interval(days => :days)
+        """), {"days": days}).mappings().first()
+        by_rule = conn.execute(text("""
+            SELECT rule_decision->>'rule_id'                                    AS rule_id,
+                   rule_decision->>'rule_action'                                AS rule_action,
+                   COUNT(*)                                                     AS matched,
+                   COUNT(*) FILTER (WHERE NOT COALESCE((rule_decision->>'agrees')::boolean, TRUE))
+                                                                                AS differs
+            FROM kirana_kart.llm_output_3
+            WHERE rule_decision IS NOT NULL
+              AND (rule_decision->>'matched')::boolean
+              AND created_at >= NOW() - make_interval(days => :days)
+            GROUP BY 1, 2
+            ORDER BY differs DESC, matched DESC
+            LIMIT 10
+        """), {"days": days}).mappings().all()
 
-        baseline_version = conn.execute(text("""
-            SELECT active_version FROM kirana_kart.kb_runtime_config
-            ORDER BY id DESC LIMIT 1
-        """)).scalar()
-
-    if rule_count == 0:
-        return _unavailable(
-            "This version has no generated rules yet — run rule generation first."
-        )
-
-    if not baseline_version:
-        return _unavailable(
-            "No policy is currently active, so there is nothing to compare "
-            "against. This will be the first live version."
-        )
-
-    if baseline_version == entity_id:
-        return _unavailable("This version is already the active baseline.")
-
-    try:
-        result = PolicySimulationService(engine).run_simulation(
-            candidate_version=entity_id,
-            baseline_version=baseline_version,
-        )
-    except Exception as exc:
-        # run_simulation raises for "no sample tickets" and "no rules for
-        # version X" — real conditions the reviewer needs to see, not a 500.
-        return _unavailable(str(exc))
-
-    tested = int(result.get("tickets_tested") or 0)
-    changed = int(result.get("differences") or 0)
-
-    if tested == 0:
-        return _unavailable("No sample tickets available to simulate against.")
-
-    unchanged_rate = (tested - changed) / tested
-    passed = unchanged_rate >= SIMULATION_GATE_THRESHOLD
-
-    metrics = {
-        "unchanged_rate": round(unchanged_rate, 4),
-        "changed_count": changed,
-        "ticket_count": tested,
-        "rule_count": rule_count,
-        "baseline_version": baseline_version,
-        "candidate_version": entity_id,
-        "threshold": SIMULATION_GATE_THRESHOLD,
-        "sample_source": "Saved simulation cases (up to 1,000; not a dated or representative sample)",
-        "examples": result.get("examples", []),
-        "measurement_scope": "Final action differences only; financial impact and customer outcomes are not measured",
-    }
-
-    with engine.connect() as conn:
-        instance_row = conn.execute(text("""
-            SELECT id FROM kirana_kart.bpm_process_instances
-            WHERE kb_id = :kb_id AND entity_id = :eid
-            ORDER BY started_at DESC LIMIT 1
-        """), {"kb_id": kb_id, "eid": entity_id}).mappings().first()
-
-    if instance_row:
-        _bpm_service.record_gate_result(
-            instance_id=instance_row["id"],
-            gate_type="simulation",
-            passed=passed,
-            metrics=metrics,
-        )
-
-    return {
-        "status": "ok",
-        "passed": passed,
-        "metrics": metrics,
-        "examples": result.get("examples", [])[:20],
-    }
+    return jsonable_encoder({
+        "mode": settings.rule_enforcement,
+        "days": days,
+        **{k: (int(v) if k != "last_evaluated_at" and v is not None else v) for k, v in dict(totals).items()},
+        "by_rule": [dict(r) for r in by_rule],
+    })
 
 
 @router.post("/kb/{kb_id}/publish")
 def publish_version_bpm(
     kb_id: str,
-    body: dict,
+    body: PublishRequest,
     u: UserContext = Depends(_policy_admin),
 ):
     """
-    Publish a policy version that is in PENDING_APPROVAL or ACTIVE stage.
+    Approve the open request for a policy version and make it live.
 
-    This endpoint previously only moved the BPM stage marker to ACTIVE and
-    committed draft proposals — it never made the policy live, so a version
-    published through the wizard showed as ACTIVE in the UI while the Cardinal
-    runtime kept serving the previous one. It now runs the same activation
-    path as POST /kb/publish (KBRegistryService.publish_version), which sets
-    kb_runtime_config.active_version *and* policy_versions.is_active.
+    Runs the same activation path as POST /kb/publish
+    (KBRegistryService.publish_version, which sets
+    kb_runtime_config.active_version *and* policy_versions.is_active),
+    together with the registry commit of the approved categories and
+    responses, the approval record and the ACTIVE stage, in one transaction:
+    a failure at any step leaves all of them unchanged. The previously live
+    version's proposal is retired.
 
-    Order matters: activation is attempted first, and the BPM stage only moves
-    once the policy is genuinely live. A failure leaves the instance in its
-    prior stage so the operator can retry, rather than showing a published
-    version that never took effect.
+    The submitter cannot publish their own request unless
+    POLICY_REQUIRE_SEPARATE_APPROVER is disabled.
     """
-    from sqlalchemy import text
-    from app.l1_ingestion.kb_registry.kb_registry_service import KBRegistryService
-    from app.l45_ml_platform.compiler.sop_extractor import commit_proposals_to_registry
+    from app.config import settings
 
     _require_kb_access(u, kb_id, "admin")
-    entity_id = body.get("entity_id", "")
-    if not entity_id:
-        raise HTTPException(status_code=400, detail="entity_id required")
-
-    with engine.connect() as conn:
-        row = conn.execute(text("""
-            SELECT id, current_stage FROM kirana_kart.bpm_process_instances
-            WHERE kb_id = :kb_id AND entity_id = :eid
-            ORDER BY started_at DESC LIMIT 1
-        """), {"kb_id": kb_id, "eid": entity_id}).mappings().first()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="BPM instance not found")
-
-    stage = row["current_stage"]
-    if stage not in ("PENDING_APPROVAL", "ACTIVE"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot publish from stage '{stage}'",
+    with _lifecycle_txn() as conn:
+        instance = lifecycle.load_proposal(conn, kb_id, _entity_id(body))
+        result = lifecycle.approve_and_activate(
+            conn, engine, kb_id, instance["id"], u, notes=body.notes,
+            require_separate_approver=settings.policy_require_separate_approver,
         )
-
-    # ------------------------------------------------------------------
-    # 1. Promote accepted proposals to the global registries.
-    #    This used to be wrapped in a bare `except: logger.warning(...)`, so
-    #    publish reported success while issue_taxonomy and master_action_codes
-    #    were never updated. A failure here is a failed publish.
-    # ------------------------------------------------------------------
-    try:
-        commit_proposals_to_registry(engine, kb_id, entity_id, actor_id=u.id)
-    except Exception:
-        logger.exception("commit_proposals_to_registry failed for entity_id=%s", entity_id)
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Could not commit the approved taxonomy and action codes to the "
-                "registry. The version has not been published. See server logs."
-            ),
-        )
-
-    # ------------------------------------------------------------------
-    # 2. Make the version live (kb_runtime_config + policy_versions.is_active).
-    #    entity_id is the version_label — both are set to the same value when
-    #    the document is uploaded (see upload_document_file).
-    # ------------------------------------------------------------------
-    already_live = False
-    try:
-        KBRegistryService(engine).publish_version(
-            version_label=entity_id,
-            published_by=u.email,
-        )
-    except Exception as exc:
-        # publish_version refuses to publish the same label twice. Re-publishing
-        # an already-ACTIVE instance is a legitimate no-op, not an error.
-        if "already published" in str(exc).lower():
-            already_live = True
-        else:
-            logger.exception("Activation failed for entity_id=%s", entity_id)
-            raise HTTPException(
-                status_code=400,
-                detail=f"Could not activate this version: {exc}",
-            )
-
-    # ------------------------------------------------------------------
-    # 3. Only now record it as ACTIVE in the process instance.
-    # ------------------------------------------------------------------
-    if stage != "ACTIVE":
-        _bpm_service.transition(
-            instance_id=row["id"],
-            to_stage="ACTIVE",
-            actor_id=u.id,
-            actor_name=u.email,
-            notes="Published via wizard",
-        )
-
-    return {
-        "message": "Published",
-        "entity_id": entity_id,
-        "active_version": entity_id,
-        "already_live": already_live,
-    }
+    return {"message": "Published", "entity_id": instance["entity_id"], **result}
 
 
 @router.post("/kb/{kb_id}/compile")
@@ -755,59 +807,27 @@ def compile_document(
     u: UserContext = Depends(_kb_edit),
 ):
     """
-    Trigger AI compilation for an uploaded document.
-    Transitions BPM from DRAFT → AI_COMPILE_QUEUED.
-    The actual compile job is picked up by the background worker.
+    Legacy: mark an upload for compilation (DRAFT → AI_COMPILE_QUEUED).
+    Policy Studio analyses documents through extract-taxonomy instead; this
+    only records the queued state.
     """
     from sqlalchemy import text
 
-    _require_kb_access(u, kb_id, "admin")
-    entity_id = body.get("entity_id", "")
-    if not entity_id:
-        raise HTTPException(status_code=400, detail="entity_id required")
+    entity_id = _entity_id(body)
+    _require_kb_access(u, kb_id, "edit")
 
-    try:
-        # Find the BPM instance for this entity
-        with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT id, current_stage FROM kirana_kart.bpm_process_instances
-                WHERE kb_id = :kb_id AND entity_id = :eid
-                ORDER BY started_at DESC LIMIT 1
-            """), {"kb_id": kb_id, "eid": entity_id}).mappings().first()
+    with _lifecycle_txn() as conn:
+        instance = lifecycle.load_proposal(conn, kb_id, entity_id, lock=True)
+        if instance["current_stage"] not in ("DRAFT", "AI_COMPILE_FAILED"):
+            raise LifecycleError(400, f"Cannot compile from stage '{instance['current_stage']}'")
+        lifecycle.start_analysis(conn, instance, u)
+        conn.execute(text("""
+            UPDATE kirana_kart.knowledge_base_raw_uploads
+            SET upload_status = 'pending_compile', registry_status = 'queued'
+            WHERE document_id = :eid AND kb_id = :kb_id
+        """), {"eid": entity_id, "kb_id": kb_id})
 
-        if not row:
-            raise HTTPException(status_code=404, detail="BPM instance not found for this entity")
-
-        if row["current_stage"] not in ("DRAFT", "AI_COMPILE_FAILED"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot compile from stage '{row['current_stage']}'",
-            )
-
-        # Transition to AI_COMPILE_QUEUED
-        _bpm_service.transition(
-            instance_id=row["id"],
-            to_stage="AI_COMPILE_QUEUED",
-            actor_id=u.id,
-            actor_name=u.email,
-            notes="Compilation triggered via wizard",
-        )
-
-        # Queue a compile job (existing mechanism via knowledge_base_raw_uploads flag)
-        with engine.begin() as conn:
-            conn.execute(text("""
-                UPDATE kirana_kart.knowledge_base_raw_uploads
-                SET upload_status = 'pending_compile', registry_status = 'queued'
-                WHERE document_id = :eid AND kb_id = :kb_id
-            """), {"eid": entity_id, "kb_id": kb_id})
-
-        return {"message": "Compilation queued", "entity_id": entity_id}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("compile_document failed")
-        raise HTTPException(status_code=500, detail="An internal error occurred. See server logs for details.")
+    return {"message": "Compilation queued", "entity_id": entity_id}
 
 
 # ============================================================
@@ -817,10 +837,11 @@ def compile_document(
 @router.get("/ml/health")
 def ml_health(
     kb_id: str = Query("default"),
-    _u: UserContext = Depends(_kb_view),
+    u: UserContext = Depends(_kb_view),
 ):
     """Return current status of all 3 ML models for the MLHealthPanel UI."""
     from app.l45_ml_platform.models.model_store import get_model_health
+    _require_kb_access(u, kb_id, "view")
     return get_model_health(engine, kb_id)
 
 
@@ -831,6 +852,7 @@ def force_retrain(
 ):
     """Manually trigger model retraining (normally runs nightly)."""
     from app.l45_ml_platform.models.training_jobs import run_nightly_retraining
+    _require_kb_access(u, kb_id, "admin")
     result = run_nightly_retraining(engine, kb_id)
     return result
 
@@ -839,10 +861,99 @@ def force_retrain(
 # SOP EXTRACTION — 3-STAGE PIPELINE
 # ============================================================
 
+# A mapping can only be pointed at another live problem: names and
+# descriptions belong to the taxonomy lifecycle.
+_TAXONOMY_EDIT_FIELDS = {"issue_code": 80}
+_ACTION_EDIT_FIELDS = {"action_name": 255, "action_description": 2000, "exact_action": 4000}
+MIN_REASON_CHARS = 3
+
+
 class ReviewProposalRequest(BaseModel):
     status: str        # 'accepted' | 'rejected' | 'edited'
-    edit_reason: Optional[str] = None
+    edit_reason: Optional[str] = Field(default=None, max_length=2000)
     user_output: Optional[dict] = None   # edited fields
+
+
+def _validated_edits(body: ReviewProposalRequest, allowed: dict[str, int]) -> Optional[dict]:
+    if body.status not in {"accepted", "rejected", "edited"}:
+        raise HTTPException(status_code=400, detail="status must be one of accepted, rejected, edited")
+    _require_reason(body.status, body.edit_reason)
+    if body.status != "edited":
+        return None
+    edits = body.user_output or {}
+    unknown = set(edits) - set(allowed)
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Cannot edit: {', '.join(sorted(unknown))}")
+    for key, limit in allowed.items():
+        value = edits.get(key)
+        if value is not None and (not isinstance(value, str) or len(value) > limit):
+            raise HTTPException(status_code=400, detail=f"{key} must be text of at most {limit} characters")
+    for name_field in ("issue_code", "action_name"):
+        if name_field in edits and not (edits[name_field] or "").strip():
+            raise HTTPException(status_code=400, detail=f"{name_field} cannot be empty")
+    if not edits:
+        raise HTTPException(status_code=400, detail="Nothing was changed")
+    return edits
+
+
+def _require_reason(status: str, reason: Optional[str]) -> None:
+    """
+    Corrections teach the next extraction, so they carry the reviewer's own
+    reason (it used to be the constant 'User correction').
+    """
+    if status in ("edited", "rejected") and len((reason or "").strip()) < MIN_REASON_CHARS:
+        raise HTTPException(status_code=400, detail="Say briefly why, so the AI does not repeat the mistake")
+
+
+def _sop_text(kb_id: str, entity_id: str) -> str:
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT markdown_content FROM kirana_kart.knowledge_base_raw_uploads
+            WHERE document_id = :eid AND kb_id = :kb_id
+        """), {"eid": entity_id, "kb_id": kb_id}).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    return row[0] or ""
+
+
+def _run_analysis(kb_id: str, entity_id: str, u: UserContext, extractor, label: str) -> dict:
+    """
+    Record the analysis start, run the (slow) LLM call outside any lock, and
+    record a failure on the proposal so it does not sit in 'analysing'.
+    """
+    from app.l45_ml_platform.compiler.sop_extractor import analysed_characters, sop_truncated
+
+    sop_text = _sop_text(kb_id, entity_id)
+    with _lifecycle_txn() as conn:
+        lifecycle.start_analysis(conn, lifecycle.load_proposal(conn, kb_id, entity_id, lock=True), u)
+    def still_editable(conn) -> None:
+        lifecycle.open_for_editing(
+            conn, lifecycle.load_proposal(conn, kb_id, entity_id, lock=True), u,
+            f"{label} analysis completed",
+        )
+
+    try:
+        proposals = extractor(engine, kb_id, entity_id, sop_text, before_write=still_editable)
+    except LifecycleError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    except Exception:
+        logger.exception("%s extraction failed for %s", label, entity_id)
+        with _lifecycle_txn() as conn:
+            lifecycle.analysis_failed(
+                conn, lifecycle.load_proposal(conn, kb_id, entity_id, lock=True), u,
+                f"{label} analysis failed",
+            )
+        raise HTTPException(status_code=500, detail=f"{label} extraction failed")
+    return {
+        "proposals": list(proposals),
+        "count": len(proposals),
+        "gaps": getattr(proposals, "gaps", None),
+        "suggested_variables": getattr(proposals, "suggested_variables", None),
+        "truncated": sop_truncated(sop_text),
+        "analysed_characters": analysed_characters(sop_text),
+        "document_characters": len(sop_text),
+    }
 
 
 @router.post("/kb/{kb_id}/extract-taxonomy")
@@ -860,36 +971,14 @@ def extract_taxonomy_stage(
     in the app. As an async handler it blocked the event loop — and therefore
     every other request — for its whole duration. FastAPI runs a sync handler
     in the threadpool. The same applies to extract_actions_stage below.
+
+    `truncated` reports when the document is longer than the analysed prefix.
     """
-    from sqlalchemy import text
     from app.l45_ml_platform.compiler.sop_extractor import extract_taxonomy
 
-    _require_kb_access(u, kb_id, "admin")
-    entity_id = body.get("entity_id", "")
-    if not entity_id:
-        raise HTTPException(status_code=400, detail="entity_id required")
+    entity_id = _entity_id(body)
     _require_kb_access(u, kb_id, "edit")
-
-    try:
-        # Fetch the markdown text for this upload
-        with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT markdown_content FROM kirana_kart.knowledge_base_raw_uploads
-                WHERE document_id = :eid AND kb_id = :kb_id
-            """), {"eid": entity_id, "kb_id": kb_id}).fetchone()
-
-        if not row:
-            raise HTTPException(status_code=404, detail="Upload not found")
-
-        sop_text = row[0] or ""
-        proposals = extract_taxonomy(engine, kb_id, entity_id, sop_text)
-        return {"proposals": proposals, "count": len(proposals)}
-
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("extract_taxonomy_stage failed")
-        raise HTTPException(status_code=500, detail="Taxonomy extraction failed")
+    return jsonable_encoder(_run_analysis(kb_id, entity_id, u, extract_taxonomy, "Taxonomy"))
 
 
 @router.get("/kb/{kb_id}/taxonomy-proposals")
@@ -905,12 +994,91 @@ def list_taxonomy_proposals(
         rows = conn.execute(text("""
             SELECT id, issue_code, label, description, parent_code, level,
                    proposal_type, status, extraction_confidence, edit_reason,
-                   llm_output, user_output, edited_at
+                   llm_output, user_output, edited_at, edited_by, source_excerpt
             FROM kirana_kart.draft_taxonomy_proposals
             WHERE kb_id = :kb_id AND entity_id = :eid
             ORDER BY level, issue_code
         """), {"kb_id": kb_id, "eid": entity_id}).mappings().all()
-    return [dict(r) for r in rows]
+    return jsonable_encoder([dict(r) for r in rows])
+
+
+def _review_proposal(kb_id: str, proposal_id: int, body: ReviewProposalRequest,
+                     u: UserContext, table: str, stage: str, ref_column: str,
+                     allowed: dict[str, int]) -> dict:
+    """
+    Record a reviewer's decision on one AI proposal, and what they changed
+    compared with what the AI produced, for the next extraction to learn from.
+    """
+    from sqlalchemy import text
+
+    edits = _validated_edits(body, allowed)
+    with _lifecycle_txn() as conn:
+        row = conn.execute(text(f"""
+            SELECT * FROM kirana_kart.{table}
+            WHERE id = :id AND kb_id = :kb_id
+        """), {"id": proposal_id, "kb_id": kb_id}).mappings().first()
+        if not row:
+            raise LifecycleError(404, "Proposal not found")
+
+        instance = lifecycle.load_proposal(conn, kb_id, row["entity_id"], lock=True)
+        lifecycle.open_for_editing(conn, instance, u, f"Review decision changed for {row[ref_column]}")
+        business_line = knowledge.business_line_of(conn, kb_id, row["entity_id"])
+
+        ai = row["llm_output"] or {}
+        if isinstance(ai, str):
+            ai = json.loads(ai)
+        if edits and "issue_code" in edits:
+            edits["issue_code"] = _remap(conn, kb_id, row, edits["issue_code"])
+
+        conn.execute(text(f"""
+            UPDATE kirana_kart.{table}
+            SET status = :status,
+                edit_reason = :reason,
+                user_output = CAST(:user_out AS jsonb),
+                edited_at = NOW(),
+                edited_by = :uid
+            WHERE id = :id
+        """), {
+            "status": body.status,
+            "reason": (body.edit_reason or "").strip() or None,
+            "user_out": json.dumps(edits) if edits else None,
+            "uid": u.id,
+            "id": proposal_id,
+        })
+
+        knowledge.log_edit(
+            conn, kb_id=kb_id, entity_id=row["entity_id"], stage=stage,
+            item_ref=row[ref_column], edit_type=body.status, business_line=business_line,
+            llm_output=ai or None, user_output=edits, reason=(body.edit_reason or "").strip() or None,
+            actor_id=u.id, confidence=row.get("extraction_confidence"),
+            changes=knowledge.field_changes(ai, edits, allowed) if edits else None,
+        )
+
+    return {"id": proposal_id, "status": body.status}
+
+
+def _remap(conn, kb_id: str, row: dict, code: str) -> str:
+    """Point a mapping at another live problem of this knowledge base."""
+    from sqlalchemy import text
+    from app.l45_ml_platform.compiler.sop_extractor import live_taxonomy
+
+    code = code.strip().upper()
+    node = live_taxonomy(conn, kb_id).get(code)
+    if node is None:
+        raise LifecycleError(400, f"{code} is not in this knowledge base's live issue taxonomy")
+    if conn.execute(text("""
+        SELECT 1 FROM kirana_kart.draft_taxonomy_proposals
+        WHERE kb_id = :kb AND entity_id = :eid AND issue_code = :code AND id <> :id
+    """), {"kb": kb_id, "eid": row["entity_id"], "code": code, "id": row["id"]}).scalar():
+        raise LifecycleError(409, f"{code} is already mapped in this proposal")
+    conn.execute(text("""
+        UPDATE kirana_kart.draft_taxonomy_proposals
+        SET issue_code = :code, label = :label, description = :desc,
+            parent_code = :parent, level = :level
+        WHERE id = :id
+    """), {"code": code, "label": node["label"], "desc": node.get("description"),
+           "parent": node.get("parent_code"), "level": node["level"], "id": row["id"]})
+    return code
 
 
 @router.put("/kb/{kb_id}/taxonomy-proposals/{proposal_id}")
@@ -921,56 +1089,9 @@ def review_taxonomy_proposal(
     u: UserContext = Depends(_kb_edit),
 ):
     """Accept, reject, or edit a taxonomy proposal. Edits recorded for ML."""
-    from sqlalchemy import text
     _require_kb_access(u, kb_id, "edit")
-
-    allowed = {"accepted", "rejected", "edited"}
-    if body.status not in allowed:
-        raise HTTPException(status_code=400, detail=f"status must be one of {allowed}")
-
-    with engine.begin() as conn:
-        row = conn.execute(text("""
-            SELECT * FROM kirana_kart.draft_taxonomy_proposals
-            WHERE id = :id AND kb_id = :kb_id
-        """), {"id": proposal_id, "kb_id": kb_id}).mappings().first()
-
-        if not row:
-            raise HTTPException(status_code=404, detail="Proposal not found")
-
-        conn.execute(text("""
-            UPDATE kirana_kart.draft_taxonomy_proposals
-            SET status = :status,
-                edit_reason = :reason,
-                user_output = :user_out,
-                edited_at = NOW(),
-                edited_by = :uid
-            WHERE id = :id
-        """), {
-            "status": body.status,
-            "reason": body.edit_reason,
-            "user_out": json.dumps(body.user_output) if body.user_output else None,
-            "uid": u.id,
-            "id": proposal_id,
-        })
-
-        # Record to edit log
-        conn.execute(text("""
-            INSERT INTO kirana_kart.rule_edit_log
-                (kb_id, entity_id, stage, item_ref, edit_type, llm_output, user_output, edit_reason, created_by)
-            VALUES
-                (:kb_id, :eid, 'taxonomy', :ref, :etype, :llm, :usr, :reason, :uid)
-        """), {
-            "kb_id": kb_id,
-            "eid": row["entity_id"],
-            "ref": row["issue_code"],
-            "etype": body.status,
-            "llm": row["llm_output"],
-            "usr": json.dumps(body.user_output) if body.user_output else None,
-            "reason": body.edit_reason,
-            "uid": u.id,
-        })
-
-    return {"id": proposal_id, "status": body.status}
+    return _review_proposal(kb_id, proposal_id, body, u, "draft_taxonomy_proposals",
+                            "taxonomy", "issue_code", _TAXONOMY_EDIT_FIELDS)
 
 
 @router.post("/kb/{kb_id}/extract-actions")
@@ -983,34 +1104,11 @@ def extract_actions_stage(
     Stage 2: LLM reads the SOP + accepted taxonomy proposals → extracts action codes.
     Must be called after at least some taxonomy proposals are accepted.
     """
-    from sqlalchemy import text
     from app.l45_ml_platform.compiler.sop_extractor import extract_actions
 
-    _require_kb_access(u, kb_id, "admin")
-    entity_id = body.get("entity_id", "")
-    if not entity_id:
-        raise HTTPException(status_code=400, detail="entity_id required")
+    entity_id = _entity_id(body)
     _require_kb_access(u, kb_id, "edit")
-
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT markdown_content FROM kirana_kart.knowledge_base_raw_uploads
-                WHERE document_id = :eid AND kb_id = :kb_id
-            """), {"eid": entity_id, "kb_id": kb_id}).fetchone()
-
-        if not row:
-            raise HTTPException(status_code=404, detail="Upload not found")
-
-        sop_text = row[0] or ""
-        proposals = extract_actions(engine, kb_id, entity_id, sop_text)
-        return {"proposals": proposals, "count": len(proposals)}
-
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("extract_actions_stage failed")
-        raise HTTPException(status_code=500, detail="Action extraction failed")
+    return jsonable_encoder(_run_analysis(kb_id, entity_id, u, extract_actions, "Action"))
 
 
 @router.get("/kb/{kb_id}/action-proposals")
@@ -1027,12 +1125,13 @@ def list_action_proposals(
             SELECT id, action_code_id, action_name, action_description, exact_action,
                    parent_issue_codes, requires_refund, requires_escalation,
                    automation_eligible, proposal_type, status,
-                   extraction_confidence, edit_reason, llm_output, user_output, edited_at
+                   extraction_confidence, edit_reason, llm_output, user_output, edited_at,
+                   edited_by, source_excerpt
             FROM kirana_kart.draft_action_proposals
             WHERE kb_id = :kb_id AND entity_id = :eid
             ORDER BY action_code_id
         """), {"kb_id": kb_id, "eid": entity_id}).mappings().all()
-    return [dict(r) for r in rows]
+    return jsonable_encoder([dict(r) for r in rows])
 
 
 @router.put("/kb/{kb_id}/action-proposals/{proposal_id}")
@@ -1043,55 +1142,9 @@ def review_action_proposal(
     u: UserContext = Depends(_kb_edit),
 ):
     """Accept, reject, or edit an action proposal. Edits recorded for ML."""
-    from sqlalchemy import text
     _require_kb_access(u, kb_id, "edit")
-
-    allowed = {"accepted", "rejected", "edited"}
-    if body.status not in allowed:
-        raise HTTPException(status_code=400, detail=f"status must be one of {allowed}")
-
-    with engine.begin() as conn:
-        row = conn.execute(text("""
-            SELECT * FROM kirana_kart.draft_action_proposals
-            WHERE id = :id AND kb_id = :kb_id
-        """), {"id": proposal_id, "kb_id": kb_id}).mappings().first()
-
-        if not row:
-            raise HTTPException(status_code=404, detail="Proposal not found")
-
-        conn.execute(text("""
-            UPDATE kirana_kart.draft_action_proposals
-            SET status = :status,
-                edit_reason = :reason,
-                user_output = :user_out,
-                edited_at = NOW(),
-                edited_by = :uid
-            WHERE id = :id
-        """), {
-            "status": body.status,
-            "reason": body.edit_reason,
-            "user_out": json.dumps(body.user_output) if body.user_output else None,
-            "uid": u.id,
-            "id": proposal_id,
-        })
-
-        conn.execute(text("""
-            INSERT INTO kirana_kart.rule_edit_log
-                (kb_id, entity_id, stage, item_ref, edit_type, llm_output, user_output, edit_reason, created_by)
-            VALUES
-                (:kb_id, :eid, 'action', :ref, :etype, :llm, :usr, :reason, :uid)
-        """), {
-            "kb_id": kb_id,
-            "eid": row["entity_id"],
-            "ref": row["action_code_id"],
-            "etype": body.status,
-            "llm": row["llm_output"],
-            "usr": json.dumps(body.user_output) if body.user_output else None,
-            "reason": body.edit_reason,
-            "uid": u.id,
-        })
-
-    return {"id": proposal_id, "status": body.status}
+    return _review_proposal(kb_id, proposal_id, body, u, "draft_action_proposals",
+                            "action", "action_code_id", _ACTION_EDIT_FIELDS)
 
 
 @router.post("/kb/{kb_id}/generate-rules")
@@ -1102,22 +1155,21 @@ def generate_rules_stage(
 ):
     """
     Stage 3: Deterministic rule generation from accepted taxonomy × action proposals.
-    No LLM call. Returns the generated rules.
+    No LLM call. Replaces the version's rules (including manual edits) and
+    moves the proposal to RULE_EDIT. Returns the rules and every accepted
+    pairing that could not become one.
     """
     from app.l45_ml_platform.compiler.sop_extractor import generate_rules
 
-    _require_kb_access(u, kb_id, "admin")
-    entity_id = body.get("entity_id", "")
-    if not entity_id:
-        raise HTTPException(status_code=400, detail="entity_id required")
+    entity_id = _entity_id(body)
     _require_kb_access(u, kb_id, "edit")
 
-    try:
-        rules = generate_rules(engine, kb_id, entity_id)
-        return {"rules": rules, "count": len(rules)}
-    except Exception:
-        logger.exception("generate_rules_stage failed")
-        raise HTTPException(status_code=500, detail="Rule generation failed")
+    with _lifecycle_txn() as conn:
+        instance = lifecycle.load_proposal(conn, kb_id, entity_id, lock=True)
+        lifecycle.open_for_editing(conn, instance, u, "Decisions regenerated")
+        result = generate_rules(engine, kb_id, entity_id, conn=conn)
+        lifecycle.rules_generated(conn, instance, u, len(result["rules"]))
+    return jsonable_encoder({**result, "count": len(result["rules"]), "stage": instance["current_stage"]})
 
 
 @router.get("/standards/{kb_id}")

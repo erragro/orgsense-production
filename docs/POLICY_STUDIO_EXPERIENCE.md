@@ -85,3 +85,265 @@ These tests use mocked API responses. No production deployment is included.
 Final browser run: nine passed; the nginx-only header test was skipped on the
 Vite preview. The legacy-condition test also exposed and verified a fix for the
 rule editor's backdrop intercepting clicks (explicit dialog z-index).
+
+## Production-readiness review — 25 September 2026
+
+The previous passes improved the wording and screens, but the workflow behind
+them could not take a proposal live. Verified against a database built by
+`alembic upgrade head`:
+
+- **Upload failed on a migrated database.** Instances reference
+  `bpm_process_definitions`, which only the retired startup DDL seeded.
+- **Every stage change failed.** `BPMService.transition()` writes
+  `bpm_process_instances.updated_at`, a column the baseline never had. Approval,
+  rejection, compile and the publish endpoint's final step all returned 500.
+- **Nothing advanced a proposal.** No UI or server path moved it past DRAFT, so
+  the wizard's launch step was permanently blocked. Meanwhile any KB editor could
+  call the generic transition endpoint to reach PENDING_APPROVAL → ACTIVE, which
+  showed a version as live that the runtime never served.
+- **Publishing failed** whenever the SOP introduced anything new:
+  `master_action_codes.action_key` was not supplied (NOT NULL), and the taxonomy
+  upsert named a unique constraint that does not exist. Wizard proposals also
+  never received the compiled `policy_versions` row and vectorization that
+  activation requires.
+- **Reviewed new responses were silently dropped** during rule generation,
+  because they were only registered at publish. L3/L4 rules recorded the parent
+  (not the root) as their L1 category. Truncated, colliding rule IDs were possible.
+- **Rule editor writes silently rolled back while reporting success.**
+  SQLAlchemy does not bind `:param::jsonb`; the swallowed training-sample failure
+  aborted the transaction, and COMMIT became a rollback. Manual rule add in the
+  wizard sent fields the API does not accept, and the action dropdown endpoint
+  selected columns that do not exist. The same cast bug broke KB creation and
+  three CRM writes.
+- **Governance gaps:** rule routes had no KB membership check and could edit the
+  live version directly; instance endpoints accepted an instance from any KB
+  through an authorised KB's URL; approvals were not checked against their own
+  KB; a submitter could approve their own change; upload size was unbounded.
+- **The sample replay used the opposite precedence to the runtime**
+  (`priority DESC` vs the worker's `priority ASC`), so the gate measured a
+  different policy from the one that would run.
+
+Now implemented (`app/admin/services/policy_lifecycle.py`):
+
+- Stages advance only as their work completes: analysis → rules generated
+  (RULE_EDIT) → sample replay (SHADOW_GATE, or SIMULATION_FAILED) → approval
+  request (PENDING_APPROVAL) → approval by a second policy administrator (ACTIVE).
+  With no live policy, the replay is recorded as *not applicable*, not as a rate.
+  A change above the threshold needs a written justification to request
+  approval. The manual transition endpoint can only reopen a proposal; nothing
+  can be moved to ACTIVE by hand.
+- Editing a tested proposal returns it to RULE_EDIT. Nothing can be edited while
+  it awaits approval or is live, including through the advanced rule editor.
+  Late-finishing AI analysis re-checks this before it writes.
+- Submitting freezes the rules (fingerprint), creates the compiled version and
+  queues vectorization. Approval refuses until preparation completes and the
+  rules still match the fingerprint.
+- Activation is one transaction: registry commit, runtime pointer and active
+  flag, approval record, ACTIVE stage, and retirement of the previously live
+  proposal. A failure at any step changes none of them.
+- `POLICY_REQUIRE_SEPARATE_APPROVER` (default `true`) enforces separation of
+  duties. The wizard ends with an approval request; approval happens in the
+  proposal drawer, which shows readiness evidence and the version being replaced.
+- Proposals can be resumed from the board. Rules are no longer regenerated (and
+  manual edits lost) on every return to step 5. Server error explanations are
+  shown instead of HTTP status text. The UI reports when an SOP was longer than
+  the 12,000 characters analysed. LLM proposals are validated, and an unconfirmed
+  "existing" claim is no longer auto-accepted.
+
+Validation: 244 backend unit tests; 16 PostgreSQL integration tests, including
+two new end-to-end Policy Studio journeys over HTTP (only the LLM is stubbed)
+that cover a failed-activation rollback, separation of duties, editing locks,
+rejection and replacement of a live version; migration upgrade → downgrade base
+→ upgrade rehearsal; strict TypeScript build; 11 Playwright tests (nginx-only
+header test skipped on preview). Coverage floor raised from 34.98% to 36.90%. No production
+deployment is included.
+
+Remaining limits, not addressed here:
+
+- **One live policy for the whole runtime.** `kb_runtime_config` is read as a
+  single pointer by the Cardinal pipeline, so approving a proposal from any KB
+  replaces the policy for all tickets. The approval screen states this. Per-KB
+  runtime policies are an architectural change.
+- **Live comparison (shadow) is still not evaluated in the pipeline.** Approval
+  shows the recorded case count, currently zero. SHADOW_GATE therefore means
+  "tested on samples", not "observed live".
+- **The replay covers rule decisions only.** Cases no rule decides are left to
+  the AI at runtime and are not replayed. Sample cases carry one issue type, so
+  rules for a specific (L2) situation never match there. (Superseded in part:
+  see "Rules decide" below.)
+- **Legacy publication routes remain:** `POST /kb/publish` and `/kb/rollback`
+  now require `policy.admin` (previously `knowledgeBase.admin` alone) and record
+  the authenticated publisher rather than a client-supplied name, but they still
+  activate versions without an approval record. Rollback is kept for emergencies.
+  Taxonomy-version approval still only changes its stage. Route these through
+  `policy_lifecycle` before relying on the approval trail as a complete control.
+- Proposals awaiting approval before this revision must be re-submitted once so
+  their runtime preparation is created.
+
+## Rules decide — 26 September 2026
+
+Measured against the SOP-Writer Wizard and Rule Editor mockups, the core gap was
+that rules did not govern decisions. Stage 1 showed the LLM the first five
+rules of the whole policy (`rules[:5]`), whatever the ticket was about. No
+condition was evaluated anywhere at runtime, Stage 2 never compared the LLM's
+choice with the rules, and rule amounts (`action_payload`) were ignored. The
+replay evaluated three legacy condition keys, so rules built in the condition
+editor matched every sample case.
+
+Now implemented (`app/l4_agents/rule_engine.py`, one evaluator for runtime and
+replay):
+
+- **Evaluation:** a rule holds when its issue category, column filters
+  (business line, segment, fraud segment, order value, prior complaints, SLA
+  breach) and condition tree (ALL/ANY, nested) all hold. Rules are tried in
+  runtime precedence (priority ascending, then rule id).
+  - **Fails closed:** a condition the evaluator cannot read, or a fact the
+    ticket does not provide, means *no match*.
+  - **Guidance-only rules:** rules marked non-deterministic are shown to the AI
+    but never decide.
+- **Stage 2 applies the first matching rule** before the tier bypass, fraud
+  zeroing and routing, so those safety checks still govern the result.
+  - **Action and amount:** the rule sets the action. `action_payload` sets
+    `refund_amount`, `refund_percent` and/or `max_refund`, and the result is
+    always within the order value.
+  - **No stated amount:** a non-refund action pays nothing, and a refund action
+    keeps the AI's amount within the rule's cap.
+  - **Evidence required:** the ticket goes to a person.
+- **`RULE_ENFORCEMENT`** (default **`observe`**): observe records the rule's
+  decision next to the actual outcome in `llm_output_3.rule_decision` (migration
+  0009) and changes nothing. Enforce lets rules decide. Policy Studio's "Rules in
+  live decisions" panel (`GET /bpm/rule-decisions/summary`) shows how often a
+  rule matched and how often it would change the outcome — the evidence for
+  switching.
+- **Stage 1 guidance:** the AI is shown the rules about the ticket's issue, in
+  precedence order, instead of the first five of the policy.
+- **Replay:** the sample replay and the full-pipeline ticket simulation use the
+  same evaluator and preview enforce mode. The replay reports how many cases the
+  candidate's rules leave to the AI.
+- **Editors:** both rule editors set the amount a deciding rule gives, and
+  amounts are validated on the server. The advanced editor no longer refuses
+  generated rules, whose empty `{}` conditions it treated as an unknown format.
+  Rule updates can now clear optional fields such as an order-value bound.
+  Editing a rule's conditions or amounts no longer fails on an unbound
+  `::jsonb` cast. The same bug was fixed in the Cardinal and QA Agent date
+  filters.
+
+Validation: 42 unit tests for the evaluator and Stage 2 in both modes, plus a
+PostgreSQL integration test. The integration test runs the worker's rule query,
+Stage 2 with its real action-registry lookup, the `llm_output_3` write and the
+summary endpoint. Browser tests cover the panel and the amount inputs.
+
+Before switching to enforce:
+
+- **Issue codes:** Stage 0's categories must use the same codes as the rules.
+  The evaluator ignores case, spaces and hyphens, but different names never
+  match.
+- **Observe first:** in the current live policy, conditions have never been
+  evaluated. Watch the panel for at least a representative period, and review
+  every rule that differs from the AI often.
+- **Unused flag:** `overrideable` is still not interpreted by the runtime.
+
+## Closed taxonomy, SOP knowledge and retained edits — 26 September 2026
+
+Three gaps made the pipeline open-ended. Stage 0 classified tickets into
+whatever labels the model returned: the candidates came from a vector corpus
+hard-coded to `v1`, and nothing checked the answer. Policy Studio could create
+new issue codes from any SOP. The only record of reviewers' corrections fed the
+next extraction after a publish, with the fixed reason "User correction".
+
+Now implemented (migration 0010):
+
+- **Map-only taxonomy.** Stage 1 of the extraction maps the SOP onto the
+  knowledge base's live issue taxonomy and cannot create codes.
+  - **Gaps:** a problem the taxonomy lacks becomes a *gap*
+    (`policy_taxonomy_gaps`) with the quoted SOP text and a suggested code for a
+    taxonomy admin. A reviewer maps it to a live code — usually one the admin
+    has just added — or dismisses it, with a reason.
+  - **Reviewer control:** a mapping can only be re-pointed at another live
+    code. Names and descriptions belong to the taxonomy.
+  - **Checks:** rule generation and submission refuse any code that is not live
+    for the knowledge base, and publishing never writes to `issue_taxonomy`.
+- **Stage 0 is closed.** The model is shown the live policy's taxonomy and must
+  answer with one of its codes; the answer is checked (`policy_knowledge.resolve_issue`).
+  - **Output shape:** `issue_type_l1` is the level-1 root and `issue_type_l2`
+    is the node, matching how rules are written.
+  - **Unrecognised answers:** these become `UNCLASSIFIED` with confidence at
+    most 0.3. Stage 2 then sends the ticket to a person (`issue_not_in_taxonomy`)
+    instead of auto-resolving it.
+  - **No taxonomy:** without a live policy or taxonomy, the earlier open
+    classification runs, reported as `taxonomy_status: unavailable`.
+- **Any SOP, in full.** Long documents are read in up to eight windows of
+  12,000 characters, cut at headings or paragraphs, and the results merged.
+  Only text beyond 96,000 characters is reported as not analysed. The nginx and
+  client timeouts allow 10 minutes for this.
+- **Editable knowledge passages** (`policy_knowledge_chunks`, versioned with the
+  proposal):
+  - **Content:** each passage has a title, text, the problems it applies to, a
+    purpose (decision, reply or both) and the SOP quote it came from, located in
+    the document where possible.
+  - **Review:** reviewers accept, edit, remove or add passages. The AI's
+    original is kept.
+  - **Change control:** accepted passages are part of the approved fingerprint,
+    so changing one after submission invalidates the approval.
+- **Variables.** Passages embed `{{name}}`:
+  - **Tenant values:** set per knowledge base, optionally per business line
+    (`policy_variables`). Examples are `business_name`, `support_tone`,
+    `support_hours`, `escalation_contact` and `refund_cap_default`.
+  - **Ticket values:** filled per ticket — `customer_tier`, `order_id`,
+    `order_value`, `order_history_summary`, `issue_label`, plus `refund_amount`
+    and `resolution_summary` in replies.
+  - **Suggestions:** the extraction suggests values it finds in the SOP but
+    sets none.
+  - **Submission check:** submission is refused while a passage uses a tenant
+    variable with no value. A value that is missing at runtime shows as
+    `[name not set]`, never a blank.
+- **Runtime use.** Stage 1 is given the rendered decision passages for the
+  ticket's problem — specific problem first, then its category, then general
+  passages; at most 6 passages and 4,000 characters. Stage 3's reply draft for
+  human review includes the rendered reply passages and signs off with
+  `business_name`. Both record which passages they used.
+- **Business line = use case.** The wizard asks which business line an SOP is
+  for. Generated rules and passages carry it, the worker matches it
+  case-insensitively, and it scopes the lessons below.
+- **What changed versus what the AI generated.**
+  - **Proposals:** every AI proposal (mapping, gap, action, passage, generated
+    rule) is logged as `proposed`; unreviewed output is no longer logged as
+    accepted. Nothing is auto-accepted: a person accepts, including in bulk
+    ("Accept confident matches ≥ 75%").
+  - **Corrections:** every edit, removal and addition — rule priority, amounts
+    and conditions in the rule editors included — records a field-level diff
+    (`field_changes`: AI value → reviewer value), the business line and the
+    reviewer's own reason, which is required.
+- **Learning is continuous.** Every extraction prompt carries the latest
+  corrections for the knowledge base: this business line's first, then the
+  rest of the knowledge base's as shared lessons (`lessons_for`). They apply
+  from the next analysis, with no publish needed. The wizard shows the same
+  list ("What the AI has learned from reviewers").
+
+Validation:
+
+- **Unit tests:** 40 new tests cover issue resolution, Stage 0, 2 and 3
+  behaviour, passage selection, rendering, runtime loading and caching, and
+  lesson text.
+- **PostgreSQL integration test, over HTTP:**
+  - mapping and gap resolution;
+  - passages with located quotes, edits with reasons and diffs;
+  - variables blocking submission, approval to live, and the taxonomy
+    unchanged;
+  - Stage 0 closed on the live policy, Stage 1 and 3 rendering;
+  - the v1 corrections appearing in v2's extraction prompts.
+- **Browser tests:** they cover the business line, lessons, gap mapping,
+  required reasons, passage review and variable entry.
+
+Known limits:
+
+- **Taxonomy admin work:** adding a code is still done through the taxonomy
+  lifecycle. Policy Studio lists the gaps (`GET /bpm/kb/{kb}/taxonomy-gaps?status=open`)
+  but does not create codes.
+- **Unlabelled replay samples:** the sample replay does not filter by business
+  line. Samples without one never match line-scoped rules, and are counted as
+  unchanged.
+- **Variable changes are not approved:** they reach live replies within the
+  60-second runtime cache and are logged, but are not approved like passages.
+- **Analysis runs in the request:** it is a long synchronous request. A
+  background job would be sturdier for very long documents.

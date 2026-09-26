@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import Field, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -200,6 +200,29 @@ class Settings(BaseSettings):
     # anonymous visitor a working account. When enabled, new accounts are
     # created inactive and hold no permissions until an admin approves them.
     signup_enabled: bool = Field(default=False, alias="SIGNUP_ENABLED")
+
+    # ------------------------------------------------------------
+    # POLICY STUDIO GOVERNANCE
+    # ------------------------------------------------------------
+    # Separation of duties: the person who submits a policy change for
+    # approval may not also approve (and thereby activate) it. Disable only
+    # for a deployment with a single policy owner; self-approvals are still
+    # recorded in the audit trail as such.
+    policy_require_separate_approver: bool = Field(
+        default=True, alias="POLICY_REQUIRE_SEPARATE_APPROVER",
+    )
+
+    # How Policy Studio rules take part in live decisions (Stage 2):
+    #   observe — every ticket records what the first matching rule would have
+    #             decided next to the actual outcome; decisions are unchanged.
+    #   enforce — the first matching deterministic rule sets the action and
+    #             any amount/cap it states; the AI's proposal is used only when
+    #             no rule matches. Fraud, tier and review safety checks still
+    #             run afterwards.
+    # Defaults to observe so enabling rules is a deliberate, reviewed switch.
+    rule_enforcement: Literal["observe", "enforce"] = Field(
+        default="observe", alias="RULE_ENFORCEMENT",
+    )
 
     # Optional comma-separated email-domain allowlist applied to both password
     # signup and OAuth account creation (e.g. "kiranakart.com,example.org").

@@ -56,6 +56,19 @@ def enable_shadow(
     user: UserContext = Depends(_admin),
 ):
     with get_db_session() as session:
+        # Any string used to be accepted, so a typo became the version every
+        # ticket would be shadow-evaluated against.
+        rules = session.execute(text("""
+            SELECT COUNT(*) FROM kirana_kart.rule_registry WHERE policy_version = :version
+        """), {"version": request.shadow_version}).scalar() or 0
+        if not rules:
+            raise HTTPException(status_code=400, detail="That version has no rules to compare.")
+        active = session.execute(text("""
+            SELECT active_version FROM kirana_kart.kb_runtime_config ORDER BY id DESC LIMIT 1
+        """)).scalar()
+        if active == request.shadow_version:
+            raise HTTPException(status_code=400, detail="That version is already the live policy.")
+
         # Target the current config row only. An unqualified UPDATE would
         # rewrite shadow_version on every historical row in the table.
         updated = session.execute(

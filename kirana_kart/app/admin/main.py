@@ -260,6 +260,7 @@ from app.admin.routes.crm_routes import router as crm_router
 from app.admin.routes.consent_routes import router as consent_router
 from app.admin.routes.data_rights_routes import router as data_rights_router
 from app.admin.routes.bpm_routes import router as bpm_router
+from app.admin.routes.policy_knowledge_routes import router as policy_knowledge_router
 from app.admin.routes.rule_routes import router as rule_router
 
 app.include_router(auth_router)
@@ -283,6 +284,7 @@ app.include_router(crm_router)
 app.include_router(consent_router)
 app.include_router(data_rights_router)
 app.include_router(bpm_router)
+app.include_router(policy_knowledge_router)
 app.include_router(rule_router)
 
 

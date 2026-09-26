@@ -39,9 +39,13 @@ KB_TRANSITIONS: Dict[str, List[str]] = {
     "AI_COMPILE_QUEUED":       ["AI_COMPILE_FAILED", "RULE_EDIT"],
     "AI_COMPILE_FAILED":       ["AI_COMPILE_QUEUED", "DRAFT"],
     "RULE_EDIT":               ["SIMULATION_GATE"],
-    "SIMULATION_GATE":         ["SIMULATION_FAILED", "SHADOW_GATE"],
-    "SIMULATION_FAILED":       ["RULE_EDIT"],
-    "SHADOW_GATE":             ["SHADOW_DIVERGENCE_HIGH", "PENDING_APPROVAL"],
+    # Editing a proposal after it was tested returns it to RULE_EDIT: the
+    # recorded evidence no longer describes the rules. SIMULATION_FAILED may
+    # also proceed to SHADOW_GATE, but only through policy_lifecycle with a
+    # recorded justification for accepting the larger change.
+    "SIMULATION_GATE":         ["SIMULATION_FAILED", "SHADOW_GATE", "RULE_EDIT"],
+    "SIMULATION_FAILED":       ["RULE_EDIT", "SHADOW_GATE"],
+    "SHADOW_GATE":             ["SHADOW_DIVERGENCE_HIGH", "PENDING_APPROVAL", "RULE_EDIT"],
     "SHADOW_DIVERGENCE_HIGH":  ["RULE_EDIT"],
     "PENDING_APPROVAL":        ["REJECTED", "ACTIVE"],
     "REJECTED":                ["RULE_EDIT"],
@@ -91,6 +95,7 @@ class BPMService:
         created_by_id: int,
         created_by_name: str,
         metadata: Optional[Dict[str, Any]] = None,
+        conn=None,
     ) -> Dict[str, Any]:
         """
         Create a new BPM process instance starting at DRAFT.
@@ -103,42 +108,49 @@ class BPMService:
             created_by_id:  User ID of the initiator
             created_by_name: Human name for display
             metadata:       Optional extra data to store on the instance
+            conn:           Optional connection; the caller then owns the transaction
 
         Returns:
             The created instance dict.
         """
-        with self.engine.begin() as conn:
-            row = conn.execute(text("""
-                INSERT INTO kirana_kart.bpm_process_instances
-                    (kb_id, process_name, entity_id, entity_type,
-                     current_stage, created_by_id, created_by_name, metadata)
-                VALUES
-                    (:kb_id, :process_name, :entity_id, :entity_type,
-                     'DRAFT', :created_by_id, :created_by_name, :metadata)
-                RETURNING *
-            """), {
-                "kb_id":           kb_id,
-                "process_name":    process_name,
-                "entity_id":       entity_id,
-                "entity_type":     entity_type,
-                "created_by_id":   created_by_id,
-                "created_by_name": created_by_name,
-                "metadata":        json.dumps(metadata or {}),
-            }).mappings().first()
+        if conn is None:
+            with self.engine.begin() as own:
+                return self.create_instance(
+                    kb_id, entity_id, entity_type, process_name,
+                    created_by_id, created_by_name, metadata, conn=own,
+                )
 
-            instance = dict(row)
+        row = conn.execute(text("""
+            INSERT INTO kirana_kart.bpm_process_instances
+                (kb_id, process_name, entity_id, entity_type,
+                 current_stage, created_by_id, created_by_name, metadata)
+            VALUES
+                (:kb_id, :process_name, :entity_id, :entity_type,
+                 'DRAFT', :created_by_id, :created_by_name, :metadata)
+            RETURNING *
+        """), {
+            "kb_id":           kb_id,
+            "process_name":    process_name,
+            "entity_id":       entity_id,
+            "entity_type":     entity_type,
+            "created_by_id":   created_by_id,
+            "created_by_name": created_by_name,
+            "metadata":        json.dumps(metadata or {}),
+        }).mappings().first()
 
-            # Log initial DRAFT transition
-            conn.execute(text("""
-                INSERT INTO kirana_kart.bpm_stage_transitions
-                    (instance_id, from_stage, to_stage, actor_id, actor_name, notes)
-                VALUES (:instance_id, 'START', 'DRAFT', :actor_id, :actor_name,
-                        'Instance created')
-            """), {
-                "instance_id": instance["id"],
-                "actor_id":    created_by_id,
-                "actor_name":  created_by_name,
-            })
+        instance = dict(row)
+
+        # Log initial DRAFT transition
+        conn.execute(text("""
+            INSERT INTO kirana_kart.bpm_stage_transitions
+                (instance_id, from_stage, to_stage, actor_id, actor_name, notes)
+            VALUES (:instance_id, 'START', 'DRAFT', :actor_id, :actor_name,
+                    'Instance created')
+        """), {
+            "instance_id": instance["id"],
+            "actor_id":    created_by_id,
+            "actor_name":  created_by_name,
+        })
 
         logger.info(
             "BPM: created instance %d | kb=%s entity=%s process=%s",
@@ -165,57 +177,78 @@ class BPMService:
         Raises ValueError if the transition is not allowed from the current stage.
         """
         with self.engine.begin() as conn:
-            row = conn.execute(text("""
-                SELECT id, current_stage, process_name, kb_id, entity_id
-                FROM kirana_kart.bpm_process_instances
-                WHERE id = :id
-                FOR UPDATE
-            """), {"id": instance_id}).mappings().first()
+            self.transition_on(
+                conn, instance_id, to_stage,
+                actor_id=actor_id, actor_name=actor_name,
+                notes=notes, transition_data=transition_data,
+            )
+        return self.get_instance(instance_id)
 
-            if not row:
-                raise ValueError(f"BPM instance {instance_id} not found")
+    @staticmethod
+    def transition_on(
+        conn,
+        instance_id: int,
+        to_stage: str,
+        actor_id: Optional[int] = None,
+        actor_name: Optional[str] = None,
+        notes: Optional[str] = None,
+        transition_data: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        transition() on the caller's connection, so a stage change can commit
+        or roll back together with the work it records (e.g. activation).
+        Returns the previous stage.
+        """
+        row = conn.execute(text("""
+            SELECT id, current_stage, process_name
+            FROM kirana_kart.bpm_process_instances
+            WHERE id = :id
+            FOR UPDATE
+        """), {"id": instance_id}).mappings().first()
 
-            current_stage = row["current_stage"]
-            process_name  = row["process_name"]
-            allowed       = _transition_map(process_name).get(current_stage, [])
+        if not row:
+            raise ValueError(f"BPM instance {instance_id} not found")
 
-            if to_stage not in allowed:
-                raise ValueError(
-                    f"Cannot transition from {current_stage} → {to_stage} "
-                    f"(allowed: {allowed})"
-                )
+        current_stage = row["current_stage"]
+        allowed = _transition_map(row["process_name"]).get(current_stage, [])
 
-            completed_at = "NOW()" if to_stage in TERMINAL_STAGES else "NULL"
+        if to_stage not in allowed:
+            raise ValueError(
+                f"Cannot transition from {current_stage} → {to_stage} "
+                f"(allowed: {allowed})"
+            )
 
-            conn.execute(text(f"""
-                UPDATE kirana_kart.bpm_process_instances
-                SET current_stage  = :to_stage,
-                    completed_at   = {completed_at},
-                    updated_at     = NOW()
-                WHERE id = :id
-            """), {"to_stage": to_stage, "id": instance_id})
+        completed_at = "NOW()" if to_stage in TERMINAL_STAGES else "NULL"
 
-            conn.execute(text("""
-                INSERT INTO kirana_kart.bpm_stage_transitions
-                    (instance_id, from_stage, to_stage, actor_id, actor_name,
-                     notes, transition_data)
-                VALUES (:instance_id, :from_stage, :to_stage, :actor_id, :actor_name,
-                        :notes, :transition_data)
-            """), {
-                "instance_id":     instance_id,
-                "from_stage":      current_stage,
-                "to_stage":        to_stage,
-                "actor_id":        actor_id,
-                "actor_name":      actor_name,
-                "notes":           notes,
-                "transition_data": json.dumps(transition_data or {}),
-            })
+        conn.execute(text(f"""
+            UPDATE kirana_kart.bpm_process_instances
+            SET current_stage  = :to_stage,
+                completed_at   = {completed_at},
+                updated_at     = NOW()
+            WHERE id = :id
+        """), {"to_stage": to_stage, "id": instance_id})
+
+        conn.execute(text("""
+            INSERT INTO kirana_kart.bpm_stage_transitions
+                (instance_id, from_stage, to_stage, actor_id, actor_name,
+                 notes, transition_data)
+            VALUES (:instance_id, :from_stage, :to_stage, :actor_id, :actor_name,
+                    :notes, :transition_data)
+        """), {
+            "instance_id":     instance_id,
+            "from_stage":      current_stage,
+            "to_stage":        to_stage,
+            "actor_id":        actor_id,
+            "actor_name":      actor_name,
+            "notes":           notes,
+            "transition_data": json.dumps(transition_data or {}, default=str),
+        })
 
         logger.info(
             "BPM: transition %d | %s → %s | actor=%s",
             instance_id, current_stage, to_stage, actor_name,
         )
-        return self.get_instance(instance_id)
+        return current_stage
 
     # ================================================================
     # REQUEST APPROVAL
@@ -540,7 +573,7 @@ class BPMService:
                 conn.execute(text("""
                     INSERT INTO kirana_kart.bpm_process_definitions
                         (process_name, kb_id, stages, gate_config)
-                    VALUES (:process_name, :kb_id, :stages::jsonb, :gate_config::jsonb)
+                    VALUES (:process_name, :kb_id, CAST(:stages AS jsonb), CAST(:gate_config AS jsonb))
                     ON CONFLICT (process_name) DO NOTHING
                 """), {
                     "process_name": process_name,

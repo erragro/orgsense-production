@@ -66,7 +66,32 @@ recorded in `kirana_kart/coverage-floor.json`; it does not invent a target perce
 6. APIs now require the exact schema revision; production also requires a valid
    32-byte PII key and completed customer backfill. Startup failure is intentional
    if either prerequisite is absent. Liveness is `/health`; readiness is `/ready`.
-7. Deploy `worker-beat` as **one** replica with Recreate, and workers consuming
+7. Policy Studio (revision 0008) needs the governance API's vector background
+   worker running: an approver cannot activate a submitted policy change until its
+   runtime preparation (vectorization) completes. `POLICY_REQUIRE_SEPARATE_APPROVER`
+   defaults to `true` (the submitter cannot approve their own change); set it to
+   `false` only for a single-owner deployment. Proposals already awaiting approval
+   before this revision must be re-submitted (Retry runtime preparation) once.
+8. Revision 0009 adds `llm_output_3.rule_decision`. `RULE_ENFORCEMENT` defaults
+   to `observe`: rules are evaluated and recorded but do not change outcomes.
+   Switch to `enforce` (API and workers) only after reviewing Policy Studio's
+   "Rules in live decisions" panel; switching back to `observe` is immediate.
+9. Revision 0010 closes the taxonomy. Once a policy is live, Stage 0 only
+   classifies into that knowledge base's active `issue_taxonomy` codes;
+   anything else is `UNCLASSIFIED` and goes to human review. Before deploying,
+   confirm that each live KB's taxonomy covers its ticket types. Watch the
+   `issue_not_in_taxonomy` discrepancy rate after the rollout. Taxonomy admins
+   work the gap queue (`GET /bpm/kb/{kb}/taxonomy-gaps?status=open`). The UI's
+   nginx now allows 600 s on `/api/governance/` for long SOP analyses; an
+   external load balancer in front of it needs the same timeout.
+10. Revision 0011 lets the first issue be added to an empty taxonomy (the
+    snapshot of an empty table was NULL in a NOT NULL column). A failed runtime
+    preparation is now recorded as `failed` with its error in
+    `kb_vector_jobs.error`, so the approver can retry it; before, the failure
+    handler updated a non-existent column and the job was retried every poll
+    while the proposal showed `pending`. Check for such stuck jobs when
+    deploying: `SELECT * FROM kirana_kart.kb_vector_jobs WHERE status = 'pending'`.
+11. Deploy `worker-beat` as **one** replica with Recreate, and workers consuming
    both `cardinal` and `celery` queues. Verify a retention task actually executes.
    Cloud Run worker deployments need continuous CPU/instances appropriate to
    background processing; the repository does not provision those settings.

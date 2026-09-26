@@ -12,22 +12,33 @@ def test_upload_saves_business_intent_with_proposal():
     with patch.object(bpm_routes, 'engine'), patch.object(bpm_routes, '_bpm_service') as bpm, patch('app.l1_ingestion.kb_registry.markdown_converter.MarkdownConverter') as converter:
         bpm.create_instance.return_value = {'id': 1}
         converter.return_value.convert.return_value = '# Missing items'
-        result = asyncio.run(bpm_routes.upload_document_file('default', UploadFile(filename='policy.md', file=BytesIO(b'# Policy')), ' Faster refunds ', ' Reduce manual review ', ' Missing items ', actor))
+        result = asyncio.run(bpm_routes.upload_document_file(
+            'default', UploadFile(filename='policy.md', file=BytesIO(b'# Policy')),
+            change_name=' Faster refunds ', business_outcome=' Reduce manual review ',
+            affected_scope=' Missing items ', business_line=' Quick Commerce ', u=actor))
         assert result['bpm_instance_id'] == 1
-        assert bpm.create_instance.call_args.kwargs['metadata']['business_brief'] == {
+        metadata = bpm.create_instance.call_args.kwargs['metadata']
+        assert metadata['business_brief'] == {
             'name': 'Faster refunds', 'outcome': 'Reduce manual review', 'scope': 'Missing items'}
+        # The use case, as tickets carry it, scopes the rules and the lessons.
+        assert metadata['business_line'] == result['business_line'] == 'quick_commerce'
 
 
 @pytest.mark.parametrize('stage', ['RULE_EDIT', 'SIMULATION_GATE', 'SHADOW_GATE'])
 def test_early_stage_cannot_activate_before_transition_validation(stage):
+    from tests.policy_fakes import FakeConn
+    conn = FakeConn(stage=stage)
     engine = MagicMock()
-    engine.connect.return_value.__enter__.return_value.execute.return_value.mappings.return_value.first.return_value = {'id': 1, 'current_stage': stage}
-    with patch.object(bpm_routes, 'engine', engine), patch('app.l1_ingestion.kb_registry.kb_registry_service.KBRegistryService') as registry, patch('app.l45_ml_platform.compiler.sop_extractor.commit_proposals_to_registry') as commit:
+    engine.begin.return_value.__enter__.return_value = conn
+    with patch.object(bpm_routes, 'engine', engine), patch.object(bpm_routes, '_require_kb_access'), \
+         patch('app.l1_ingestion.kb_registry.kb_registry_service.KBRegistryService') as registry, \
+         patch('app.l45_ml_platform.compiler.sop_extractor.commit_proposals_to_registry') as commit:
         with pytest.raises(HTTPException) as error:
-            bpm_routes.publish_version_bpm('default', {'entity_id': 'proposal'}, MagicMock())
-        assert error.value.status_code == 400
+            bpm_routes.publish_version_bpm('default', bpm_routes.PublishRequest(entity_id='proposal'), MagicMock())
+        assert error.value.status_code == 409
         registry.assert_not_called()
         commit.assert_not_called()
+    assert conn.transitions == []
 
 
 def test_shadow_statistics_scope_to_current_version_pair():
@@ -67,9 +78,10 @@ def test_publish_requires_access_to_selected_kb():
     with patch.object(bpm_routes, '_bpm_service') as bpm, patch.object(bpm_routes, 'engine') as engine:
         bpm.check_kb_access.return_value = False
         with pytest.raises(HTTPException) as error:
-            bpm_routes.publish_version_bpm('restricted', {'entity_id': 'proposal'}, actor)
+            bpm_routes.publish_version_bpm('restricted', bpm_routes.PublishRequest(entity_id='proposal'), actor)
     assert error.value.status_code == 403
     engine.connect.assert_not_called()
+    engine.begin.assert_not_called()
 
 
 def test_proposal_lookup_filters_before_limit():

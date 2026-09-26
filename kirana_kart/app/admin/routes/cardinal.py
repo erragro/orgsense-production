@@ -357,10 +357,10 @@ def cardinal_executions(
         conditions.append("f.module = :module")
         params["module"] = module
     if date_from:
-        conditions.append("f.created_at >= :date_from::date")
+        conditions.append("f.created_at >= CAST(:date_from AS date)")
         params["date_from"] = date_from
     if date_to:
-        conditions.append("f.created_at < :date_to::date + INTERVAL '1 day'")
+        conditions.append("f.created_at < CAST(:date_to AS date) + INTERVAL '1 day'")
         params["date_to"] = date_to
     if search:
         try:
@@ -551,10 +551,10 @@ def cardinal_audit(
         conditions.append("stage_name = :stage_name")
         params["stage_name"] = stage_name
     if date_from:
-        conditions.append("event_time >= :date_from::date")
+        conditions.append("event_time >= CAST(:date_from AS date)")
         params["date_from"] = date_from
     if date_to:
-        conditions.append("event_time < :date_to::date + INTERVAL '1 day'")
+        conditions.append("event_time < CAST(:date_to AS date) + INTERVAL '1 day'")
         params["date_to"] = date_to
 
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""

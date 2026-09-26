@@ -454,7 +454,7 @@ def _log_action(
                  refund_amount_before, refund_amount_after)
             VALUES
                 (:ticket_id, :queue_id, :actor_id, :action_type,
-                 :before_val::jsonb, :after_val::jsonb, :reason,
+                 CAST(:before_val AS jsonb), CAST(:after_val AS jsonb), :reason,
                  :refund_before, :refund_after)
         """),
         {
@@ -1683,7 +1683,7 @@ def save_view(
         row = session.execute(
             text("""
                 INSERT INTO kirana_kart.crm_saved_views (owner_id, name, filters, sort_by, sort_dir, is_default)
-                VALUES (:uid, :name, :filters::jsonb, :sort_by, :sort_dir, :is_default)
+                VALUES (:uid, :name, CAST(:filters AS jsonb), :sort_by, :sort_dir, :is_default)
                 RETURNING *
             """),
             {
@@ -2364,7 +2364,7 @@ def create_automation_rule(
                      conditions, actions, priority, created_by)
                 VALUES
                     (:name, :desc, :trigger, :logic,
-                     :conds::jsonb, :acts::jsonb, :priority, :creator)
+                     CAST(:conds AS jsonb), CAST(:acts AS jsonb), :priority, :creator)
                 RETURNING id
             """),
             {

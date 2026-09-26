@@ -646,6 +646,7 @@ def _run_stage_0(
             _s0_span.set_attribute("stage.issue_type_l1", str(stage0.get("issue_type_l1", "")))
             _s0_span.set_attribute("stage.issue_type_l2", str(stage0.get("issue_type_l2", "")))
             _s0_span.set_attribute("stage.confidence",    str(stage0.get("confidence", "")))
+            _s0_span.set_attribute("stage.taxonomy_status", str(stage0.get("taxonomy_status", "")))
 
     result = {
         "llm_output_1_id": None,
@@ -655,6 +656,10 @@ def _run_stage_0(
         "image_required":  stage0.get("image_required", False),
         "reasoning":       stage0.get("reasoning", ""),
         "raw_response":    stage0.get("raw_response", "LLM"),
+        # 'mapped' / 'unmapped' against the live taxonomy, or 'unavailable'.
+        "taxonomy_status": stage0.get("taxonomy_status", "unavailable"),
+        "issue_label":     stage0.get("issue_label"),
+        "model_issue":     stage0.get("model_issue"),
     }
 
     # Write stub row to llm_output_1
@@ -912,6 +917,10 @@ def _run_stage_2(
             _s2_span.set_attribute("stage.final_action",   str(stage2.get("final_action_code", "")))
             _s2_span.set_attribute("stage.pathway",        str(stage2.get("automation_pathway", "")))
             _s2_span.set_attribute("stage.validation",     str(stage2.get("validation_status", "")))
+            rule = stage2.get("rule_decision") or {}
+            _s2_span.set_attribute("rule.mode",    str(rule.get("mode", "")))
+            _s2_span.set_attribute("rule.id",      str(rule.get("rule_id") or ""))
+            _s2_span.set_attribute("rule.applied", bool(rule.get("applied")))
 
     result = {
         "llm_output_3_id":        None,
@@ -922,6 +931,7 @@ def _run_stage_2(
         "discrepancy_detected":   stage2.get("discrepancy_detected", False),
         "reasoning":              stage2.get("reasoning", ""),
         "automation_pathway":     stage2.get("automation_pathway", "AUTO_RESOLVED"),
+        "rule_decision":          stage2.get("rule_decision"),
     }
 
     conn = _get_connection()
@@ -956,14 +966,15 @@ def _run_stage_2(
                         override_type,
                         llm_overall_accuracy,
                         detailed_reasoning,
-                        policy_version
+                        policy_version,
+                        rule_decision
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s,
                         %s, %s, %s,
                         %s, %s, %s,
-                        %s, %s, %s
+                        %s, %s, %s, %s
                     )
                     ON CONFLICT (ticket_id, execution_id) DO UPDATE SET
                         order_id                           = EXCLUDED.order_id,
@@ -992,6 +1003,7 @@ def _run_stage_2(
                         llm_overall_accuracy               = EXCLUDED.llm_overall_accuracy,
                         detailed_reasoning                 = EXCLUDED.detailed_reasoning,
                         policy_version                     = EXCLUDED.policy_version,
+                        rule_decision                      = EXCLUDED.rule_decision,
                         updated_at                         = CURRENT_TIMESTAMP
                     RETURNING id
                     """,
@@ -1024,6 +1036,7 @@ def _run_stage_2(
                         stage2.get("llm_overall_accuracy"),
                         stage2.get("reasoning"),
                         fields.get("active_policy") or "",
+                        psycopg2.extras.Json(stage2["rule_decision"]) if stage2.get("rule_decision") else None,
                     ),
                 )
                 row = cur.fetchone()
@@ -1116,7 +1129,8 @@ def _fetch_rules(
     not tied to the ticket's lowercase module label ("delivery", "quality", etc.).
     The rule_registry module_name is a human-readable category name used inside
     the KB pipeline, not a ticket-module selector.
-    Returns rules ordered by priority ASC (lower number = higher priority).
+    Returns rules ordered by priority ASC (lower number = higher priority),
+    with every field app.l4_agents.rule_engine evaluates.
     """
     if not policy_version:
         logger.warning("Cannot fetch rules: policy_version missing")
@@ -1128,16 +1142,22 @@ def _fetch_rules(
             cur.execute(
                 f"""
                 SELECT
-                    rule_id, rule_type, priority, rule_scope,
-                    filters, numeric_constraints, flags,
-                    conditions, action_id, action_payload,
-                    issue_type_l1, issue_type_l2,
-                    customer_segment, fraud_segment,
-                    module_name
-                FROM {SCHEMA}.rule_registry
-                WHERE policy_version = %s
-                AND   (business_line = %s OR business_line IS NULL)
-                ORDER BY priority ASC
+                    r.rule_id, r.rule_type, r.priority, r.rule_scope,
+                    r.filters, r.numeric_constraints, r.flags,
+                    r.conditions, r.action_id, r.action_payload,
+                    r.issue_type_l1, r.issue_type_l2,
+                    r.customer_segment, r.fraud_segment, r.business_line,
+                    r.min_order_value, r.max_order_value,
+                    r.min_repeat_count, r.max_repeat_count,
+                    r.sla_breach_required, r.evidence_required,
+                    r.deterministic, r.overrideable,
+                    r.module_name,
+                    m.action_code_id
+                FROM {SCHEMA}.rule_registry r
+                LEFT JOIN {SCHEMA}.master_action_codes m ON m.id = r.action_id
+                WHERE r.policy_version = %s
+                AND   (LOWER(r.business_line) = LOWER(%s) OR r.business_line IS NULL)
+                ORDER BY r.priority ASC, r.rule_id ASC
                 """,
                 (policy_version, business_line),
             )
