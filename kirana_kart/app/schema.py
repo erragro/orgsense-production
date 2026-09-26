@@ -2,7 +2,7 @@
 from sqlalchemy import text
 from app.admin.db import engine
 
-SCHEMA_REVISION = '0010_policy_knowledge'
+SCHEMA_REVISION = '0011_empty_taxonomy_snapshot'
 
 
 def verify_schema():

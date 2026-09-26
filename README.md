@@ -136,10 +136,25 @@ Tested scope and unresolved operational/legal claims are in
 
 ```bash
 cp .env.example .env
-cp .env.example kirana_kart/.env
-# Configure DB/Redis/JWT/PII keys and optional integrations before starting.
-docker compose up -d
+# Fill in .env (see below), then give the services the same values:
+cp .env kirana_kart/.env
+# The UI image serves a prebuilt bundle (kirana_kart_ui/dist is not in git):
+(cd kirana_kart_ui && npm ci && npm run build)
+docker compose up -d --build
 ```
+
+Minimum `.env` values for a local stack:
+
+- `DB_PASSWORD`, `REDIS_PASSWORD`, `WEAVIATE_API_KEY`, `GRAFANA_ADMIN_PASSWORD`: any local values.
+- `JWT_SECRET_KEY`: `python -c "import secrets; print(secrets.token_hex(64))"`.
+- `PII_ENCRYPTION_KEY`: exactly 64 hex characters, `python -c "import secrets; print(secrets.token_hex(32))"`.
+- `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD`: the first login.
+- `LLM_API_KEY`: an OpenAI key. SOP analysis, classification and runtime preparation (embeddings, `text-embedding-3-large`) all call it.
+- `POLICY_REQUIRE_SEPARATE_APPROVER=false` if you are the only user: otherwise a Policy Studio change you submit needs a second policy administrator to approve it.
+
+A fresh database has no issue taxonomy. Policy Studio only maps SOPs onto existing
+customer problems, so add them first (Customer Problems page, or `POST /taxonomy/add`);
+problems an SOP describes that are not in the taxonomy are listed as gaps.
 
 Services:
 - UI: http://localhost:5173

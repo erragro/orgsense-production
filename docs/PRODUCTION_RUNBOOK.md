@@ -84,7 +84,14 @@ recorded in `kirana_kart/coverage-floor.json`; it does not invent a target perce
    work the gap queue (`GET /bpm/kb/{kb}/taxonomy-gaps?status=open`). The UI's
    nginx now allows 600 s on `/api/governance/` for long SOP analyses; an
    external load balancer in front of it needs the same timeout.
-10. Deploy `worker-beat` as **one** replica with Recreate, and workers consuming
+10. Revision 0011 lets the first issue be added to an empty taxonomy (the
+    snapshot of an empty table was NULL in a NOT NULL column). A failed runtime
+    preparation is now recorded as `failed` with its error in
+    `kb_vector_jobs.error`, so the approver can retry it; before, the failure
+    handler updated a non-existent column and the job was retried every poll
+    while the proposal showed `pending`. Check for such stuck jobs when
+    deploying: `SELECT * FROM kirana_kart.kb_vector_jobs WHERE status = 'pending'`.
+11. Deploy `worker-beat` as **one** replica with Recreate, and workers consuming
    both `cardinal` and `celery` queues. Verify a retention task actually executes.
    Cloud Run worker deployments need continuous CPU/instances appropriate to
    background processing; the repository does not provision those settings.

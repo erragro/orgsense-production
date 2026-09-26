@@ -79,6 +79,7 @@ class VectorService:
         conn.autocommit = False
 
         policy_version = None
+        job_id = None
 
         try:
 
@@ -107,6 +108,7 @@ class VectorService:
                     return
 
                 policy_version = job["version_label"]
+                job_id = job["id"]
 
                 logger.info(
                     f"Starting vectorization for {policy_version}"
@@ -141,7 +143,7 @@ class VectorService:
             logger.error(f"Vectorization failed: {str(e)}")
 
             if policy_version:
-                self._mark_failed_job(policy_version, str(e))
+                self._mark_failed_job(policy_version, str(e), job_id)
 
             raise
 
@@ -354,7 +356,14 @@ Action:
     # Mark Failed Job
     # --------------------------------------------------------
 
-    def _mark_failed_job(self, policy_version: str, error_message: str):
+    def _mark_failed_job(self, policy_version: str, error_message: str, job_id: int | None = None):
+        """
+        Record a failed job so the proposal shows 'failed' and can be retried.
+        Matched by id: the rollback before this call has already undone the
+        job's 'in_progress' status, and the column is `error` — the previous
+        UPDATE (status = 'in_progress', error_message) matched nothing or
+        raised, leaving the job pending and retried every poll, forever.
+        """
 
         conn = self._get_connection()
 
@@ -365,10 +374,12 @@ Action:
                 cur.execute("""
                     UPDATE kirana_kart.kb_vector_jobs
                     SET status = 'failed',
-                        error_message = %s
-                    WHERE version_label = %s
-                      AND status = 'in_progress';
-                """, (error_message, policy_version))
+                        error = %s,
+                        completed_at = NOW()
+                    WHERE id = %s
+                       OR (%s IS NULL AND version_label = %s
+                           AND status IN ('pending', 'in_progress'));
+                """, (error_message[:2000], job_id, job_id, policy_version))
 
                 cur.execute("""
                     UPDATE kirana_kart.policy_versions
