@@ -33,6 +33,7 @@ from sqlalchemy.engine import Engine
 
 from app.admin.db import engine
 from app.admin.routes.auth import UserContext, require_permission
+from app.admin.services import policy_knowledge_service as knowledge
 from app.admin.services import policy_lifecycle as lifecycle
 from app.admin.services.bpm_service import BPMService
 from app.admin.services.policy_lifecycle import LifecycleError
@@ -104,6 +105,8 @@ class RuleUpdate(BaseModel):
     action_payload: Optional[dict] = None
     deterministic: Optional[bool] = None
     overrideable: Optional[bool] = None
+    # Why the reviewer changed the rule; kept with the AI-vs-human diff.
+    edit_reason: Optional[str] = Field(default=None, max_length=2000)
 
     @field_validator("action_payload")
     @classmethod
@@ -136,6 +139,41 @@ def _seed_training_sample(conn, kb_id: str, correction_type: str, input_data: di
             })
     except Exception:
         logger.warning("Failed to seed ml_training_samples — skipping", exc_info=True)
+
+
+_RULE_FIELDS = (
+    "module_name", "rule_type", "priority", "rule_scope", "issue_type_l1", "issue_type_l2",
+    "business_line", "customer_segment", "fraud_segment", "min_order_value", "max_order_value",
+    "min_repeat_count", "max_repeat_count", "sla_breach_required", "evidence_required",
+    "conditions", "action_id", "action_payload", "deterministic", "overrideable",
+)
+
+
+def _log_rule_change(conn, kb_id: str, version: str, before: dict, after: dict,
+                     edit_type: str, reason: Optional[str], user: UserContext) -> None:
+    """
+    Record a rule change against what the generator wrote for it, when it
+    did, so a correction reads 'AI said X, reviewer set Y' even after
+    several edits. Rules written by hand diff against their previous value.
+    """
+    generated = conn.execute(text("""
+        SELECT llm_output FROM kirana_kart.rule_edit_log
+        WHERE kb_id = :kb AND entity_id = :v AND stage = 'rule'
+          AND item_ref = :ref AND edit_type = 'proposed'
+        ORDER BY id DESC LIMIT 1
+    """), {"kb": kb_id, "v": version, "ref": before.get("rule_id")}).scalar() or {}
+    if isinstance(generated, str):
+        generated = __import__("json").loads(generated)
+    baseline = {**before, **{k: v for k, v in generated.items() if k in _RULE_FIELDS}}
+    changes = knowledge.field_changes(baseline, after, _RULE_FIELDS) if after else None
+    if edit_type == "edited" and not changes:
+        return
+    knowledge.log_edit(
+        conn, kb_id=kb_id, entity_id=version, stage="rule", item_ref=before.get("rule_id"),
+        edit_type=edit_type, business_line=before.get("business_line"),
+        llm_output=generated or None, user_output=after or None,
+        reason=(reason or "").strip() or None, actor_id=user.id, changes=changes,
+    )
 
 
 def _require_kb_access(user: UserContext, kb_id: str, required_role: str) -> None:
@@ -277,6 +315,11 @@ def create_rule(kb_id: str, body: RuleCreate, u: UserContext = Depends(_kb_edit)
                 {"policy_version": body.policy_version},
                 body.model_dump(),
             )
+            knowledge.log_edit(
+                conn, kb_id=kb_id, entity_id=body.policy_version, stage="rule", item_ref=rule_id,
+                edit_type="manual_add", business_line=body.business_line,
+                user_output=body.model_dump(), actor_id=u.id,
+            )
 
         return {"id": row["id"], "rule_id": row["rule_id"]}
     except LifecycleError as exc:
@@ -303,6 +346,7 @@ def update_rule(
         # exclude_none used to drop them, so a cleared bound silently stayed.
         # Columns that cannot be null are only ever changed, never cleared.
         updates = body.model_dump(exclude_unset=True)
+        reason = updates.pop("edit_reason", None)
         for required in ("module_name", "rule_type", "action_id", "priority", "rule_scope",
                          "issue_type_l1", "conditions", "action_payload", "deterministic",
                          "overrideable", "sla_breach_required", "evidence_required"):
@@ -332,6 +376,9 @@ def update_rule(
                 SELECT 1 FROM kirana_kart.master_action_codes WHERE id = :id
             """), {"id": updates["action_id"]}).scalar():
                 raise HTTPException(status_code=400, detail="Unknown action")
+            before = conn.execute(text("""
+                SELECT * FROM kirana_kart.rule_registry WHERE id = :id AND kb_id = :kb_id
+            """), {"id": rule_db_id, "kb_id": kb_id}).mappings().first()
             result = conn.execute(text(f"""
                 UPDATE kirana_kart.rule_registry
                 SET {set_clause}
@@ -343,6 +390,7 @@ def update_rule(
                 raise HTTPException(status_code=404, detail="Rule not found")
 
             _seed_training_sample(conn, kb_id, "edit", {"rule_db_id": rule_db_id}, updates)
+            _log_rule_change(conn, kb_id, version, dict(before), updates, "edited", reason, u)
 
         return {"id": row["id"], "rule_id": row["rule_id"]}
     except LifecycleError as exc:
@@ -358,6 +406,7 @@ def update_rule(
 def delete_rule(
     kb_id: str,
     rule_db_id: int,
+    reason: Optional[str] = Query(default=None, max_length=2000),
     u: UserContext = Depends(_kb_edit),
 ):
     """Delete a rule. Seeds a deletion training sample."""
@@ -369,12 +418,13 @@ def delete_rule(
             result = conn.execute(text("""
                 DELETE FROM kirana_kart.rule_registry
                 WHERE id = :id AND kb_id = :kb_id
-                RETURNING rule_id
+                RETURNING *
             """), {"id": rule_db_id, "kb_id": kb_id})
             row = result.mappings().first()
             if not row:
                 raise HTTPException(status_code=404, detail="Rule not found")
             _seed_training_sample(conn, kb_id, "delete", {"rule_db_id": rule_db_id}, {})
+            _log_rule_change(conn, kb_id, version, dict(row), {}, "rejected", reason, u)
     except LifecycleError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.detail)
     except HTTPException:

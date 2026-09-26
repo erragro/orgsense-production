@@ -32,6 +32,7 @@ from typing import Any, Optional
 from sqlalchemy import text
 
 from app.admin.services.bpm_service import BPMService
+from app.admin.services import policy_knowledge_service as knowledge
 
 logger = logging.getLogger("kirana_kart.policy_lifecycle")
 
@@ -97,7 +98,13 @@ def review_counts(conn, kb_id: str, entity_id: str) -> dict:
           (SELECT COUNT(*) FROM kirana_kart.draft_action_proposals
             WHERE kb_id = :kb AND entity_id = :eid AND status IN ('accepted','edited')) AS actions_accepted,
           (SELECT COUNT(*) FROM kirana_kart.rule_registry
-            WHERE kb_id = :kb AND policy_version = :eid)                     AS rules
+            WHERE kb_id = :kb AND policy_version = :eid)                     AS rules,
+          (SELECT COUNT(*) FROM kirana_kart.policy_knowledge_chunks
+            WHERE kb_id = :kb AND entity_id = :eid AND status = 'pending')   AS knowledge_pending,
+          (SELECT COUNT(*) FROM kirana_kart.policy_knowledge_chunks
+            WHERE kb_id = :kb AND entity_id = :eid AND status IN ('accepted','edited')) AS knowledge_accepted,
+          (SELECT COUNT(*) FROM kirana_kart.policy_taxonomy_gaps
+            WHERE kb_id = :kb AND entity_id = :eid AND status = 'open')      AS gaps_open
     """), {"kb": kb_id, "eid": entity_id}).mappings().first()
     return {k: int(v or 0) for k, v in dict(row).items()}
 
@@ -112,7 +119,11 @@ def runtime_versions(conn) -> tuple[Optional[str], Optional[str]]:
 
 
 def rules_fingerprint(conn, entity_id: str) -> str:
-    """Hash of everything in a version's rules that affects a decision."""
+    """
+    Hash of everything in a version that affects a decision: its rules and
+    the knowledge passages Stage 1 and Stage 3 read. An approval covers
+    exactly this; any later change invalidates it.
+    """
     rows = conn.execute(text("""
         SELECT rule_id, module_name, rule_type, priority, rule_scope,
                issue_type_l1, issue_type_l2, business_line, customer_segment,
@@ -124,7 +135,17 @@ def rules_fingerprint(conn, entity_id: str) -> str:
         WHERE policy_version = :eid
         ORDER BY rule_id, id
     """), {"eid": entity_id}).mappings().all()
-    payload = json.dumps([dict(r) for r in rows], sort_keys=True, default=str)
+    chunks = conn.execute(text("""
+        SELECT chunk_key, business_line, title, body, issue_codes, purpose, sort_order
+        FROM kirana_kart.policy_knowledge_chunks
+        WHERE entity_id = :eid AND status IN ('accepted', 'edited')
+        ORDER BY chunk_key
+    """), {"eid": entity_id}).mappings().all()
+    content = [dict(r) for r in rows]
+    if chunks:
+        # Versions without passages keep the hash they were approved with.
+        content = {"rules": content, "knowledge": [dict(c) for c in chunks]}
+    payload = json.dumps(content, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -368,11 +389,15 @@ def submit_for_approval(conn, kb_id: str, entity_id: str, actor,
     counts = review_counts(conn, kb_id, entity_id)
     if counts["rules"] == 0:
         raise LifecycleError(409, "This proposal has no decisions to approve.")
-    if counts["taxonomy_pending"] + counts["actions_pending"]:
+    if counts["taxonomy_pending"] + counts["actions_pending"] + counts["knowledge_pending"]:
         raise LifecycleError(409, "Resolve every pending review item before requesting approval.")
     problems = taxonomy_problems(conn, kb_id, entity_id)
     if problems:
-        raise LifecycleError(409, "Fix the customer-problem hierarchy first: " + "; ".join(problems))
+        raise LifecycleError(409, "Fix the customer-problem mapping first: " + "; ".join(problems))
+    missing = knowledge.undefined_in_chunks(conn, kb_id, entity_id, knowledge.business_line_of(conn, kb_id, entity_id))
+    if missing:
+        raise LifecycleError(409, "Set these variables before requesting approval: "
+                             + ", ".join("{{%s}}" % m for m in missing))
     if conn.execute(text("""
         SELECT 1 FROM kirana_kart.knowledge_base_versions WHERE version_label = :eid
     """), {"eid": entity_id}).scalar():
@@ -443,6 +468,10 @@ def readiness(conn, kb_id: str, entity_id: str) -> dict:
         "live_version": active,
         "live_comparison_version": shadow,
         "live_comparison_cases": int(live_cases),
+        "business_line": knowledge.business_line_of(conn, kb_id, entity_id),
+        "undefined_variables": knowledge.undefined_in_chunks(
+            conn, kb_id, entity_id, knowledge.business_line_of(conn, kb_id, entity_id),
+        ),
     }
 
 

@@ -243,9 +243,11 @@ class PolicySimulationService:
             "cx_email": ticket_full.get("cx_email", ""),
             "channel": "email",
             "recommended_queue": "STANDARD_REVIEW",
+            "business_line": ticket_full.get("business_line") or "",
         }
 
-        # 4. Stage 0 — runs ONCE (classification is policy-version agnostic)
+        # 4. Stage 0 — runs ONCE, into the candidate's knowledge base taxonomy
+        # (closed classification; both versions normally share the KB).
         sim_exec_id = f"sim-{ticket_id}-{uuid.uuid4().hex[:8]}"
         try:
             from app.l4_agents.ecommerce.stage0_classifier import run as stage0_run
@@ -253,7 +255,7 @@ class PolicySimulationService:
                 ticket_id=ticket_id,
                 execution_id=sim_exec_id,
                 ticket_context=ticket_context,
-                fields=base_fields,
+                fields={**base_fields, "active_policy": candidate_version},
             )
         except Exception as e:
             logger.warning("Stage0 failed in simulation: %s", e)

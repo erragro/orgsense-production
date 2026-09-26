@@ -76,7 +76,15 @@ recorded in `kirana_kart/coverage-floor.json`; it does not invent a target perce
    to `observe`: rules are evaluated and recorded but do not change outcomes.
    Switch to `enforce` (API and workers) only after reviewing Policy Studio's
    "Rules in live decisions" panel; switching back to `observe` is immediate.
-9. Deploy `worker-beat` as **one** replica with Recreate, and workers consuming
+9. Revision 0010 closes the taxonomy. Once a policy is live, Stage 0 only
+   classifies into that knowledge base's active `issue_taxonomy` codes;
+   anything else is `UNCLASSIFIED` and goes to human review. Before deploying,
+   confirm that each live KB's taxonomy covers its ticket types. Watch the
+   `issue_not_in_taxonomy` discrepancy rate after the rollout. Taxonomy admins
+   work the gap queue (`GET /bpm/kb/{kb}/taxonomy-gaps?status=open`). The UI's
+   nginx now allows 600 s on `/api/governance/` for long SOP analyses; an
+   external load balancer in front of it needs the same timeout.
+10. Deploy `worker-beat` as **one** replica with Recreate, and workers consuming
    both `cardinal` and `celery` queues. Verify a retention task actually executes.
    Cloud Run worker deployments need continuous CPU/instances appropriate to
    background processing; the repository does not provision those settings.

@@ -15,7 +15,8 @@ class FakeConn:
                          "entity_type": entity_type, "current_stage": stage,
                          "process_name": "kb_policy_lifecycle", "metadata": {}}
         self.counts = {"taxonomy_pending": 0, "taxonomy_accepted": 1, "actions_pending": 0,
-                       "actions_accepted": 1, "rules": 5, **(counts or {})}
+                       "actions_accepted": 1, "rules": 5, "knowledge_pending": 0,
+                       "knowledge_accepted": 0, "gaps_open": 0, **(counts or {})}
         self.runtime = runtime            # (active_version, shadow_version) or None
         self.approval = approval          # pending approval row or None
         self.version = version            # policy_versions row or None

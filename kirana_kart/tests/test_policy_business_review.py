@@ -12,10 +12,16 @@ def test_upload_saves_business_intent_with_proposal():
     with patch.object(bpm_routes, 'engine'), patch.object(bpm_routes, '_bpm_service') as bpm, patch('app.l1_ingestion.kb_registry.markdown_converter.MarkdownConverter') as converter:
         bpm.create_instance.return_value = {'id': 1}
         converter.return_value.convert.return_value = '# Missing items'
-        result = asyncio.run(bpm_routes.upload_document_file('default', UploadFile(filename='policy.md', file=BytesIO(b'# Policy')), ' Faster refunds ', ' Reduce manual review ', ' Missing items ', actor))
+        result = asyncio.run(bpm_routes.upload_document_file(
+            'default', UploadFile(filename='policy.md', file=BytesIO(b'# Policy')),
+            change_name=' Faster refunds ', business_outcome=' Reduce manual review ',
+            affected_scope=' Missing items ', business_line=' Quick Commerce ', u=actor))
         assert result['bpm_instance_id'] == 1
-        assert bpm.create_instance.call_args.kwargs['metadata']['business_brief'] == {
+        metadata = bpm.create_instance.call_args.kwargs['metadata']
+        assert metadata['business_brief'] == {
             'name': 'Faster refunds', 'outcome': 'Reduce manual review', 'scope': 'Missing items'}
+        # The use case, as tickets carry it, scopes the rules and the lessons.
+        assert metadata['business_line'] == result['business_line'] == 'quick_commerce'
 
 
 @pytest.mark.parametrize('stage', ['RULE_EDIT', 'SIMULATION_GATE', 'SHADOW_GATE'])

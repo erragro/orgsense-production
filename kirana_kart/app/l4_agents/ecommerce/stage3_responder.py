@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.l4_agents import policy_knowledge
+
 
 def run(
     ticket_id: int,
@@ -47,8 +49,26 @@ def run(
         recommended_queue=fields.get("recommended_queue", "STANDARD_REVIEW"),
     )
 
+    knowledge = policy_knowledge.load_runtime(
+        fields.get("active_policy") or "", fields.get("business_line") or "",
+    )
+    values = knowledge.values(policy_knowledge.ticket_values(
+        fields, stage0_result, stage2_result, action_summary,
+    ))
+    passages = policy_knowledge.rendered(
+        policy_knowledge.select_chunks(
+            knowledge.chunks, issue_l1, issue_l2, "response", policy_knowledge.STAGE3_CHUNK_LIMIT,
+        ),
+        values,
+    )
+    sign_off = f"{values['business_name']} Support Team" if values.get("business_name") else "Customer Support Team"
+
     # Build the draft response the agent will review and edit before sending
-    issue_label = f"{issue_l1} — {issue_l2}" if issue_l2 else issue_l1
+    issue_label = f"{issue_l1} — {issue_l2}" if issue_l2 else str(issue_l1)
+    customer_issue = str(stage0_result.get("issue_label") or issue_label)
+    policy_lines: list[str] = []
+    for passage in passages:
+        policy_lines += [passage["text"], ""]
     draft_lines = [
         f"[DRAFT — HITL REVIEW REQUIRED | Queue: {hitl_queue}]",
         "",
@@ -56,21 +76,28 @@ def run(
         "",
         "Hi,",
         "",
-        f"Thank you for reaching out. We have reviewed your {issue_label.lower()} complaint.",
+        f"Thank you for reaching out. We have reviewed your {customer_issue.lower()} complaint.",
         "",
         action_summary,
         "",
+        *policy_lines,
         "If you have any questions or require further assistance, please do not hesitate to get in touch.",
         "",
         "Warm regards,",
-        "Customer Support Team",
+        sign_off,
         "",
         "---",
         f"[Agent note: Refund amount = INR {refund_amount:.2f} | Action = {action_code} | "
         f"Order value = INR {order_value:.2f} | SLA breach = {sla_breach}]",
     ]
 
+    if passages:
+        draft_lines.append(
+            "[Policy passages used: " + ", ".join(p["chunk_key"] or "?" for p in passages) + "]"
+        )
+
     return {
+        "policy_knowledge_used": [p["chunk_key"] for p in passages],
         "response_draft": "\n".join(draft_lines),
         "hitl_queue":     hitl_queue,
         "action_code":    action_code,

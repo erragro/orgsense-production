@@ -7,7 +7,7 @@ from typing import Any
 from app.config import settings
 from app.l4_agents.ecommerce.llm_client import LLMClient
 from app.l4_agents.ecommerce.retrieval import RetrievalService
-from app.l4_agents import rule_engine
+from app.l4_agents import policy_knowledge, rule_engine
 
 logger = logging.getLogger("stage1_evaluator")
 
@@ -60,8 +60,20 @@ def run(
     if policy_version:
         rule_hits = retrieval.policy_rule_candidates(query, policy_version=policy_version, top_k=5)
 
+    # The reviewed SOP passages for this problem, with the tenant's and the
+    # ticket's values filled in.
+    knowledge = policy_knowledge.load_runtime(policy_version, fields.get("business_line") or "")
+    passages = policy_knowledge.rendered(
+        policy_knowledge.select_chunks(
+            knowledge.chunks, stage0_result.get("issue_type_l1"), stage0_result.get("issue_type_l2"),
+            "decision", policy_knowledge.STAGE1_CHUNK_LIMIT, policy_knowledge.STAGE1_CHAR_BUDGET,
+        ),
+        knowledge.values(policy_knowledge.ticket_values(fields, stage0_result)),
+    )
+
     system = (
         "You are an automated support decision engine. "
+        "Where policy_knowledge is given, it is the approved SOP for this problem; follow it. "
         "Return JSON with keys: action_code, calculated_gratification, "
         "fraud_segment, greedy_classification, reasoning."
     )
@@ -77,6 +89,7 @@ def run(
             rule_engine.relevant(rules, {"issue_type_l1": stage0_result.get("issue_type_l1")})
         ),
         "vector_rules": rule_hits,
+        "policy_knowledge": [{"title": p["title"], "text": p["text"]} for p in passages],
     }
 
     order_value = float(order_ctx.get("order_value", 0) or 0)
@@ -152,6 +165,7 @@ def run(
         "action_confidence": 0.7,
         "reasoning": "fallback",
         "raw_response": None,
+        "policy_knowledge_used": [p["chunk_key"] for p in passages],
     }
 
     try:

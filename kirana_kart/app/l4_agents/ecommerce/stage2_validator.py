@@ -152,6 +152,10 @@ def run(
         requested = rule_decision["rule_amount"]
         evidence_review = decision.evidence_required
 
+    # Stage 0 could not place the ticket in the live taxonomy: no rule was
+    # written for it, so a person decides rather than the model alone.
+    issue_unmapped = stage0_result.get("taxonomy_status") == "unmapped"
+
     # Cap refund to order value
     final_refund = min(requested, order_value) if order_value else requested
 
@@ -170,6 +174,7 @@ def run(
         and greedy_pre == "NORMAL"              # no active fraud signals
         and requested > 0                       # there is a refund to approve
         and not evidence_review                 # a deciding rule demands evidence review
+        and not issue_unmapped                  # no policy covers this problem
     ):
         return {
             "rule_decision":             rule_decision,
@@ -259,6 +264,9 @@ def run(
     if not automation_eligible:
         discrepancies.append(f"action_not_automation_eligible:{action_code}")
 
+    if issue_unmapped:
+        discrepancies.append(f"issue_not_in_taxonomy:{stage0_result.get('model_issue') or 'unknown'}")
+
     discrepancy_detected = len(discrepancies) > 0
     discrepancy_count    = len(discrepancies)
 
@@ -309,6 +317,7 @@ def run(
 
     hitl_triggers = [
         evidence_review,                        # deciding rule requires evidence
+        issue_unmapped,                         # outside the live taxonomy
         final_refund > 0,
         requires_refund_flag,
         greedy_classification == "SUSPICIOUS" and final_refund > 0,

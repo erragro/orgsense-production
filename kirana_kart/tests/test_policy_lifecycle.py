@@ -172,21 +172,48 @@ class TestApprovalAuthorisation:
 
 class TestProposalCleaning:
 
-    def test_llm_taxonomy_is_normalised_and_unstorable_rows_dropped(self):
-        from app.l45_ml_platform.compiler.sop_extractor import _clean_taxonomy
-        cleaned = _clean_taxonomy([
-            {"issue_code": "missing item", "label": "Missing", "level": 1, "proposal_type": "existing"},
-            {"issue_code": "MISSING_ITEM", "label": "Duplicate", "level": 1},
-            {"issue_code": "DEEP", "label": "Too deep", "level": 9},
-            {"issue_code": "", "label": "No code", "level": 1},
-            {"issue_code": "CHILD", "label": "Child", "level": "2", "parent_code": "missing-item",
-             "extraction_confidence": 7},
-            "not a dict",
-        ], known_codes=set())
-        assert [c["issue_code"] for c in cleaned] == ["MISSING_ITEM", "CHILD"]
-        assert cleaned[0]["proposal_type"] == "new"      # 'existing' not confirmed by registry
-        assert cleaned[1]["parent_code"] == "MISSING_ITEM"
-        assert cleaned[1]["extraction_confidence"] is None
+    TAXONOMY = {
+        "MISSING_ITEM": {"issue_code": "MISSING_ITEM", "label": "Missing item", "level": 1},
+        "MISSING_ITEM_PARTIAL": {"issue_code": "MISSING_ITEM_PARTIAL", "label": "Part of order missing",
+                                 "level": 2, "parent_code": "MISSING_ITEM"},
+    }
+
+    def test_only_live_codes_are_mapped_and_everything_else_is_a_gap(self):
+        from app.l45_ml_platform.compiler.sop_extractor import _clean_mappings
+        mappings, gaps = _clean_mappings({
+            "mappings": [
+                {"issue_code": "missing item", "extraction_confidence": 0.6, "source_quote": "q1"},
+                {"issue_code": "MISSING_ITEM", "extraction_confidence": 0.9},     # better duplicate
+                {"issue_code": "INVENTED_CODE", "label": "Damaged packaging"},      # not live → gap
+                "not a dict",
+            ],
+            "gaps": [
+                {"label": "Part of order missing"},          # names a live problem → mapping
+                {"label": "Damaged packaging", "suggested_code": "damaged pack"},   # duplicate gap
+                {"label": ""},
+            ],
+        }, self.TAXONOMY)
+        assert sorted(m["issue_code"] for m in mappings) == ["MISSING_ITEM", "MISSING_ITEM_PARTIAL"]
+        best = next(m for m in mappings if m["issue_code"] == "MISSING_ITEM")
+        assert best["extraction_confidence"] == 0.9 and best["source_excerpt"] == "q1"
+        assert [g["label"] for g in gaps] == ["Damaged packaging"]
+        assert gaps[0]["suggested_code"] == "INVENTED_CODE"
+
+    def test_an_empty_taxonomy_turns_every_problem_into_a_gap(self):
+        from app.l45_ml_platform.compiler.sop_extractor import _clean_mappings
+        mappings, gaps = _clean_mappings({"taxonomy": [
+            {"issue_code": "NEW_THING", "label": "New thing", "proposal_type": "new"}]}, {})
+        assert mappings == [] and [g["label"] for g in gaps] == ["New thing"]
+
+    def test_long_documents_are_read_in_windows(self):
+        from app.l45_ml_platform.compiler import sop_extractor as x
+        doc = ("# Section\n" + "word " * 1500 + "\n\n") * 6        # ~45k characters
+        windows = x.sop_windows(doc)
+        assert len(windows) > 1
+        assert "".join(w for _, w in windows) == doc[:x.analysed_characters(doc)]
+        assert all(len(w) <= x.SOP_CHAR_LIMIT for _, w in windows)
+        assert not x.sop_truncated(doc)
+        assert x.sop_truncated("x" * (x.SOP_ANALYSED_LIMIT + 1))
 
     def test_confirmed_existing_codes_keep_their_type(self):
         from app.l45_ml_platform.compiler.sop_extractor import _clean_actions
@@ -209,13 +236,16 @@ class TestProposalCleaning:
 class TestReviewEdits:
 
     def test_only_reviewable_fields_can_be_edited(self):
-        body = bpm_routes.ReviewProposalRequest(status="edited", user_output={"issue_code": "X"})
+        # Problem names belong to the taxonomy; a reviewer can only re-map.
+        body = bpm_routes.ReviewProposalRequest(status="edited", user_output={"label": "X"},
+                                                edit_reason="wrong name")
         with pytest.raises(HTTPException) as exc:
             bpm_routes._validated_edits(body, bpm_routes._TAXONOMY_EDIT_FIELDS)
         assert exc.value.status_code == 400
 
     def test_names_cannot_be_blanked(self):
-        body = bpm_routes.ReviewProposalRequest(status="edited", user_output={"action_name": " "})
+        body = bpm_routes.ReviewProposalRequest(status="edited", user_output={"action_name": " "},
+                                                edit_reason="blanking")
         with pytest.raises(HTTPException):
             bpm_routes._validated_edits(body, bpm_routes._ACTION_EDIT_FIELDS)
 
@@ -247,10 +277,11 @@ class TestLateAnalysis:
         def frozen(conn):
             raise LifecycleError(409, "awaiting approval")
 
-        with patch.object(sop_extractor, "_call_llm", return_value={"taxonomy": [
-                {"issue_code": "X", "label": "X", "level": 1}]}), \
-             patch.object(sop_extractor, "_get_existing_taxonomy", return_value=[]), \
-             patch.object(sop_extractor, "_get_extraction_standards", return_value=""):
+        with patch.object(sop_extractor, "_call_llm", return_value={"mappings": [
+                {"issue_code": "X", "extraction_confidence": 0.9}]}), \
+             patch.object(sop_extractor, "live_taxonomy",
+                          return_value={"X": {"issue_code": "X", "label": "X", "level": 1}}), \
+             patch.object(sop_extractor, "_guidance", return_value=""):
             with pytest.raises(LifecycleError):
                 sop_extractor.extract_taxonomy(engine, "default", "v1", "SOP", before_write=frozen)
         assert not any("DELETE" in str(c.args[0]) for c in write_conn.execute.call_args_list)

@@ -7,7 +7,10 @@ test(`business proposal carries intent into an honest approval request (publishe
   const category = { id: 1, issue_code: 'MISSING_ITEM', label: 'Missing item', level: 1, parent_code: null, status: 'accepted', proposal_type: 'existing', description: 'An ordered item did not arrive' }
   const action = { id: 1, action_code_id: 'REFUND', action_name: 'Refund missing item', status: 'accepted', proposal_type: 'existing', parent_issue_codes: ['MISSING_ITEM'], requires_refund: true, automation_eligible: false }
   const rule = { id: 1, rule_id: 'rule-1', issue_type_l1: 'MISSING_ITEM', issue_type_l2: null, action_id: 3, action_name: 'Refund missing item', priority: 500, conditions: {}, deterministic: false, min_order_value: null, max_order_value: null }
-  const state = { uploaded: false, actions: false, rules: false, stage: 'DRAFT' }
+  const state = { uploaded: false, actions: false, rules: false, stage: 'DRAFT', passages: false, accepted: false, hours: false }
+  const gap = { id: 1, business_line: 'ecommerce', label: 'Damaged packaging', description: null, suggested_code: 'DAMAGED_PACKAGING', suggested_parent_code: null, source_excerpt: 'Crushed boxes are refunded', extraction_confidence: 0.7, status: 'open', mapped_issue_code: null, resolution_note: null }
+  const passage = () => ({ id: 9, chunk_key: 'K000-ABC123', business_line: 'ecommerce', title: 'Refund window', body: 'Refund within a day. Support is open {{support_hours}}.', issue_codes: ['MISSING_ITEM'], purpose: 'decision', source_excerpt: 'Refund eligible missing items.', source_start: 16, source_end: 46, origin: 'ai', status: state.accepted ? 'accepted' : 'pending', llm_output: null, edit_reason: null, variables: ['support_hours'], undefined_variables: state.hours ? [] : ['support_hours'] })
+  const posted: Record<string, unknown> = {}
   let justification = ''
   await page.addInitScript(user => { localStorage.setItem('kk_auth', JSON.stringify({ state: { user }, version: 0 })) }, user)
   await page.route('**/api/governance/**', async route => {
@@ -20,8 +23,19 @@ test(`business proposal carries intent into an honest approval request (publishe
     else if (path.endsWith('/upload')) {
       const body = route.request().postData() ?? ''
       expect(body).toContain(brief.name); expect(body).toContain(brief.outcome); expect(body).toContain('affected_scope')
+      expect(body).toContain('name="business_line"'); expect(body).toContain('grocery')
       state.uploaded = true; json = { entity_id:'proposal-1', filename:'policy.md', bpm_instance_id:1 }
-    } else if (path.endsWith('/extract-taxonomy')) json = { proposals:[category], count:1, truncated:true, analysed_characters:12000, document_characters:30000 }
+    } else if (path.endsWith('/extract-taxonomy')) json = { proposals:[category], count:1, gaps:[gap], truncated:true, analysed_characters:96000, document_characters:130000 }
+    else if (path.endsWith('/business-lines')) json = { business_lines:['ecommerce','grocery'] }
+    else if (path.endsWith('/lessons')) json = { business_line:'grocery', lessons:[{ id:1, stage:'chunk', item_ref:'K1', edit_type:'edited', edit_reason:'Name the business', business_line:'grocery', same_line:true, summary:'- chunk K1 corrected. Why: Name the business', created_at:'2026-09-20T10:00:00Z' }] }
+    else if (path.endsWith('/live-taxonomy')) json = [{ issue_code:'MISSING_ITEM', label:'Missing item', level:1, parent_code:null, description:null }, { issue_code:'WRONG_ITEM', label:'Wrong item', level:1, parent_code:null, description:null }]
+    else if (path.endsWith('/taxonomy-gaps')) json = [gap]
+    else if (path.endsWith('/taxonomy-gaps/1')) { posted.gap = JSON.parse(route.request().postData() ?? '{}'); gap.status = 'mapped'; gap.mapped_issue_code = 'WRONG_ITEM'; json = { id:1, status:'mapped', mapped_issue_code:'WRONG_ITEM' } }
+    else if (path.endsWith('/extract-knowledge')) { state.passages = true; json = { proposals:[passage()], count:1, suggested_variables:[{ name:'support_hours', value:'9am to 9pm', defined:false }], truncated:false, analysed_characters:100, document_characters:100 } }
+    else if (path.endsWith('/knowledge')) json = { business_line:'grocery', chunks: state.passages ? [passage()] : [], undefined_variables: state.passages && !state.hours ? ['support_hours'] : [] }
+    else if (path.endsWith('/accept-all')) { const body = JSON.parse(route.request().postData() ?? '{}'); posted[`accept-${body.kind}`] = body; if (body.kind === 'knowledge') state.accepted = true; json = { accepted:1 } }
+    else if (path.endsWith('/variables') && route.request().method() === 'PUT') { posted.variable = JSON.parse(route.request().postData() ?? '{}'); state.hours = true; json = { id:1, business_line:'', name:'support_hours', value:'9am to 9pm', description:null, updated_at:'' } }
+    else if (path.endsWith('/variables')) json = { variables:[], suggested:[{ name:'support_hours', description:'When human support is available' }], ticket_variables:[{ name:'customer_tier', description:'tier' }] }
     else if (path.endsWith('/taxonomy-proposals')) json = [category]
     else if (path.endsWith('/extract-actions')) { state.actions = true; json = { proposals:[action], count:1, truncated:false, analysed_characters:100, document_characters:100 } }
     else if (path.endsWith('/action-proposals')) json = state.actions ? [action] : []
@@ -29,7 +43,7 @@ test(`business proposal carries intent into an honest approval request (publishe
     else if (path.endsWith('/action-codes')) json = [{ id:3, action_code_id:'REFUND', action_name:'Refund missing item' }]
     else if (path.endsWith('/rules/default')) json = state.rules ? [rule] : []
     else if (path.endsWith('/simulate')) { state.stage = 'SIMULATION_FAILED'; json = {status:'ok', passed:false, stage:'SIMULATION_FAILED', metrics:{unchanged_rate:0.7,changed_count:3,ticket_count:10,rule_count:1,baseline_version:'current',candidate_version:'proposal-1',threshold:0.8}, examples:[{ticket_id:1,baseline:'Manual review',candidate:'Refund missing item'}]} }
-    else if (path.endsWith('/readiness')) json = { stage:state.stage, review:{taxonomy_pending:0,taxonomy_accepted:1,actions_pending:0,actions_accepted:1,rules:1}, preparation_status: state.stage === 'PENDING_APPROVAL' ? 'pending' : null, rules_unchanged_since_submission:false, pending_approval:null, live_version:'current', live_comparison_version:null, live_comparison_cases:0 }
+    else if (path.endsWith('/readiness')) json = { stage:state.stage, review:{taxonomy_pending:0,taxonomy_accepted:1,actions_pending:0,actions_accepted:1,rules:1,knowledge_pending:0,knowledge_accepted:1,gaps_open:0}, preparation_status: state.stage === 'PENDING_APPROVAL' ? 'pending' : null, rules_unchanged_since_submission:false, pending_approval:null, live_version:'current', live_comparison_version:null, live_comparison_cases:0, business_line:'grocery', undefined_variables:[] }
     else if (path.endsWith('/submit')) { justification = JSON.parse(route.request().postData() ?? '{}').justification; state.stage = 'PENDING_APPROVAL'; json = { stage:'PENDING_APPROVAL', approval:{id:5} } }
     else if (path.endsWith('/rule-decisions/summary')) json = { mode:'observe', days:7, evaluated:40, matched:30, applied:0, differs:6, last_evaluated_at:'2026-09-25T10:00:00Z', by_rule:[{ rule_id:'R-MISSING-REFUND', rule_action:'REFUND', matched:30, differs:6 }] }
     else if (path.endsWith('/publish')) throw new Error('The wizard must not activate a policy')
@@ -53,12 +67,27 @@ test(`business proposal carries intent into an honest approval request (publishe
   await dialog.getByLabel('Name this change').fill(brief.name)
   await dialog.getByLabel('What business outcome are you aiming for?').fill(brief.outcome)
   await dialog.getByLabel('Who or what should this affect?', {exact:false}).fill(brief.scope)
+  await dialog.getByLabel('Business line', {exact:false}).fill('grocery')
   await dialog.locator('input[type=file]').setInputFiles({name:'policy.md',mimeType:'text/markdown',buffer:Buffer.from('# Missing items\nRefund eligible missing items.')})
   await dialog.getByRole('button', {name:'Create proposal',exact:true}).click()
   await dialog.getByRole('button', {name:'Identify customer problems',exact:true}).click()
-  await expect(dialog.getByText('Only the first 12,000 of 30,000 characters were analysed', {exact:false})).toBeVisible()
+  await expect(dialog.getByText('Only the first 96,000 of 130,000 characters were analysed', {exact:false})).toBeVisible()
+  await expect(dialog.getByText('1 problem your taxonomy has no code for', {exact:false})).toBeVisible()
+  await dialog.getByText('What the AI has learned from reviewers (1)', {exact:false}).click()
+  await expect(dialog.getByText('Why: Name the business', {exact:false})).toBeVisible()
   await dialog.getByRole('button', {name:'Review customer problems',exact:true}).click()
   await expect(dialog.getByRole('heading', {name:'Which customer problems does this cover?'})).toBeVisible()
+  // A correction needs a reason before it can be saved.
+  await dialog.getByRole('button', {name:'Reject',exact:true}).first().click()
+  await expect(dialog.getByRole('button', {name:'Reject',exact:true}).last()).toBeDisabled()
+  await dialog.getByRole('button', {name:'Cancel',exact:true}).click()
+  // A problem the taxonomy lacks is mapped onto a live code, never created.
+  const gaps = dialog.getByRole('region', {name:'Problems your taxonomy does not cover'})
+  await gaps.getByLabel('Existing problem that covers it').selectOption('WRONG_ITEM')
+  await gaps.getByLabel('Why?', {exact:false}).fill('Crushed boxes count as wrong items here')
+  await gaps.getByRole('button', {name:'Map',exact:true}).click()
+  await page.screenshot({path:testInfo.outputPath('policy-mapping.png'),fullPage:true})
+  await expect.poll(() => posted.gap).toEqual({ action:'map', issue_code:'WRONG_ITEM', note:'Crushed boxes count as wrong items here' })
   await dialog.getByRole('button', {name:'Identify responses',exact:true}).click()
   await dialog.getByRole('button', {name:'Identify responses',exact:true}).click()
   await dialog.getByRole('button', {name:'Connect problems to responses',exact:true}).click()
@@ -72,7 +101,19 @@ test(`business proposal carries intent into an honest approval request (publishe
   await dialog.getByLabel('Percent of order').fill('50')
   await dialog.getByLabel('Never more than (₹)').fill('400')
   await dialog.getByRole('button', {name:'Cancel',exact:true}).click()
-  await dialog.getByRole('button', {name:'Compare sample decisions',exact:true}).click()
+  await dialog.getByRole('button', {name:'Review SOP knowledge',exact:true}).click()
+  await dialog.getByRole('button', {name:'Extract passages',exact:true}).click()
+  await expect(dialog.getByText('Support is open {{support_hours}}.', {exact:false})).toBeVisible()
+  await expect(dialog.getByText('(found in the SOP)', {exact:false})).toBeVisible()
+  const next = dialog.getByRole('button', {name:'Compare sample decisions',exact:true})
+  await expect(next).toBeDisabled()
+  await dialog.getByRole('button', {name:'Accept all (1)',exact:true}).click()
+  await expect.poll(() => posted['accept-knowledge']).toEqual({ kind:'knowledge' })
+  await expect(dialog.getByLabel('Value for support_hours')).toHaveValue('9am to 9pm')    // found in the SOP
+  await page.screenshot({path:testInfo.outputPath('policy-knowledge.png'),fullPage:true})
+  await dialog.getByRole('region', {name:'Variables'}).getByRole('button', {name:'Save',exact:true}).click()
+  await expect.poll(() => posted.variable).toEqual({ name:'support_hours', value:'9am to 9pm', business_line:null })
+  await next.click()
   await dialog.getByRole('button', {name:'Run Preview',exact:true}).click()
   await expect(dialog.getByText('Larger change: review the differences')).toBeVisible()
   await expect(dialog.getByText('Manual review', {exact:true})).toBeVisible()

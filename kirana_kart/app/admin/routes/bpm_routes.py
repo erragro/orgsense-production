@@ -53,6 +53,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.admin.db import engine
 from app.admin.routes.auth import UserContext, require_permission
+from app.admin.services import policy_knowledge_service as knowledge
 from app.admin.services import policy_lifecycle as lifecycle
 from app.admin.services.bpm_service import BPMService
 from app.admin.services.policy_lifecycle import LifecycleError, SIMULATION_GATE_THRESHOLD  # noqa: F401
@@ -546,6 +547,7 @@ async def upload_document_file(
     change_name: str = Form(default="", max_length=160),
     business_outcome: str = Form(default="", max_length=2000),
     affected_scope: str = Form(default="", max_length=1000),
+    business_line: str = Form(default="", max_length=60),
     u: UserContext = Depends(_kb_edit),
 ):
     """
@@ -568,6 +570,11 @@ async def upload_document_file(
             status_code=400,
             detail=f"Unsupported file format '.{ext}'. Allowed: {', '.join(sorted(ALLOWED_FORMATS))}",
         )
+
+    try:
+        line = knowledge.normalise_business_line(business_line)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     entity_id = f"{kb_id}-{uuid.uuid4().hex[:10]}"
     if len(entity_id) > MAX_ENTITY_ID_LENGTH:
@@ -634,7 +641,7 @@ async def upload_document_file(
                     "name": change_name.strip() or filename,
                     "outcome": business_outcome.strip(),
                     "scope": affected_scope.strip(),
-                }},
+                }, "business_line": line},
                 conn=conn,
             )
     except HTTPException:
@@ -648,6 +655,7 @@ async def upload_document_file(
         "filename": filename,
         "upload_id": entity_id,
         "bpm_instance_id": instance["id"],
+        "business_line": line,
     }
 
 
@@ -853,8 +861,11 @@ def force_retrain(
 # SOP EXTRACTION — 3-STAGE PIPELINE
 # ============================================================
 
-_TAXONOMY_EDIT_FIELDS = {"label": 255, "description": 2000}
+# A mapping can only be pointed at another live problem: names and
+# descriptions belong to the taxonomy lifecycle.
+_TAXONOMY_EDIT_FIELDS = {"issue_code": 80}
 _ACTION_EDIT_FIELDS = {"action_name": 255, "action_description": 2000, "exact_action": 4000}
+MIN_REASON_CHARS = 3
 
 
 class ReviewProposalRequest(BaseModel):
@@ -866,6 +877,7 @@ class ReviewProposalRequest(BaseModel):
 def _validated_edits(body: ReviewProposalRequest, allowed: dict[str, int]) -> Optional[dict]:
     if body.status not in {"accepted", "rejected", "edited"}:
         raise HTTPException(status_code=400, detail="status must be one of accepted, rejected, edited")
+    _require_reason(body.status, body.edit_reason)
     if body.status != "edited":
         return None
     edits = body.user_output or {}
@@ -876,10 +888,21 @@ def _validated_edits(body: ReviewProposalRequest, allowed: dict[str, int]) -> Op
         value = edits.get(key)
         if value is not None and (not isinstance(value, str) or len(value) > limit):
             raise HTTPException(status_code=400, detail=f"{key} must be text of at most {limit} characters")
-    name_field = "label" if "label" in allowed else "action_name"
-    if name_field in edits and not (edits[name_field] or "").strip():
-        raise HTTPException(status_code=400, detail=f"{name_field} cannot be empty")
+    for name_field in ("issue_code", "action_name"):
+        if name_field in edits and not (edits[name_field] or "").strip():
+            raise HTTPException(status_code=400, detail=f"{name_field} cannot be empty")
+    if not edits:
+        raise HTTPException(status_code=400, detail="Nothing was changed")
     return edits
+
+
+def _require_reason(status: str, reason: Optional[str]) -> None:
+    """
+    Corrections teach the next extraction, so they carry the reviewer's own
+    reason (it used to be the constant 'User correction').
+    """
+    if status in ("edited", "rejected") and len((reason or "").strip()) < MIN_REASON_CHARS:
+        raise HTTPException(status_code=400, detail="Say briefly why, so the AI does not repeat the mistake")
 
 
 def _sop_text(kb_id: str, entity_id: str) -> str:
@@ -899,7 +922,7 @@ def _run_analysis(kb_id: str, entity_id: str, u: UserContext, extractor, label: 
     Record the analysis start, run the (slow) LLM call outside any lock, and
     record a failure on the proposal so it does not sit in 'analysing'.
     """
-    from app.l45_ml_platform.compiler.sop_extractor import sop_truncated, SOP_CHAR_LIMIT
+    from app.l45_ml_platform.compiler.sop_extractor import analysed_characters, sop_truncated
 
     sop_text = _sop_text(kb_id, entity_id)
     with _lifecycle_txn() as conn:
@@ -923,10 +946,12 @@ def _run_analysis(kb_id: str, entity_id: str, u: UserContext, extractor, label: 
             )
         raise HTTPException(status_code=500, detail=f"{label} extraction failed")
     return {
-        "proposals": proposals,
+        "proposals": list(proposals),
         "count": len(proposals),
+        "gaps": getattr(proposals, "gaps", None),
+        "suggested_variables": getattr(proposals, "suggested_variables", None),
         "truncated": sop_truncated(sop_text),
-        "analysed_characters": min(len(sop_text), SOP_CHAR_LIMIT),
+        "analysed_characters": analysed_characters(sop_text),
         "document_characters": len(sop_text),
     }
 
@@ -969,7 +994,7 @@ def list_taxonomy_proposals(
         rows = conn.execute(text("""
             SELECT id, issue_code, label, description, parent_code, level,
                    proposal_type, status, extraction_confidence, edit_reason,
-                   llm_output, user_output, edited_at
+                   llm_output, user_output, edited_at, edited_by, source_excerpt
             FROM kirana_kart.draft_taxonomy_proposals
             WHERE kb_id = :kb_id AND entity_id = :eid
             ORDER BY level, issue_code
@@ -980,6 +1005,10 @@ def list_taxonomy_proposals(
 def _review_proposal(kb_id: str, proposal_id: int, body: ReviewProposalRequest,
                      u: UserContext, table: str, stage: str, ref_column: str,
                      allowed: dict[str, int]) -> dict:
+    """
+    Record a reviewer's decision on one AI proposal, and what they changed
+    compared with what the AI produced, for the next extraction to learn from.
+    """
     from sqlalchemy import text
 
     edits = _validated_edits(body, allowed)
@@ -993,42 +1022,63 @@ def _review_proposal(kb_id: str, proposal_id: int, body: ReviewProposalRequest,
 
         instance = lifecycle.load_proposal(conn, kb_id, row["entity_id"], lock=True)
         lifecycle.open_for_editing(conn, instance, u, f"Review decision changed for {row[ref_column]}")
+        business_line = knowledge.business_line_of(conn, kb_id, row["entity_id"])
+
+        ai = row["llm_output"] or {}
+        if isinstance(ai, str):
+            ai = json.loads(ai)
+        if edits and "issue_code" in edits:
+            edits["issue_code"] = _remap(conn, kb_id, row, edits["issue_code"])
 
         conn.execute(text(f"""
             UPDATE kirana_kart.{table}
             SET status = :status,
                 edit_reason = :reason,
-                user_output = :user_out,
+                user_output = CAST(:user_out AS jsonb),
                 edited_at = NOW(),
                 edited_by = :uid
             WHERE id = :id
         """), {
             "status": body.status,
-            "reason": body.edit_reason,
+            "reason": (body.edit_reason or "").strip() or None,
             "user_out": json.dumps(edits) if edits else None,
             "uid": u.id,
             "id": proposal_id,
         })
 
-        # Record to edit log
-        conn.execute(text("""
-            INSERT INTO kirana_kart.rule_edit_log
-                (kb_id, entity_id, stage, item_ref, edit_type, llm_output, user_output, edit_reason, created_by)
-            VALUES
-                (:kb_id, :eid, :stage, :ref, :etype, :llm, :usr, :reason, :uid)
-        """), {
-            "kb_id": kb_id,
-            "eid": row["entity_id"],
-            "stage": stage,
-            "ref": row[ref_column],
-            "etype": body.status,
-            "llm": json.dumps(row["llm_output"]) if row["llm_output"] is not None else None,
-            "usr": json.dumps(edits) if edits else None,
-            "reason": body.edit_reason,
-            "uid": u.id,
-        })
+        knowledge.log_edit(
+            conn, kb_id=kb_id, entity_id=row["entity_id"], stage=stage,
+            item_ref=row[ref_column], edit_type=body.status, business_line=business_line,
+            llm_output=ai or None, user_output=edits, reason=(body.edit_reason or "").strip() or None,
+            actor_id=u.id, confidence=row.get("extraction_confidence"),
+            changes=knowledge.field_changes(ai, edits, allowed) if edits else None,
+        )
 
     return {"id": proposal_id, "status": body.status}
+
+
+def _remap(conn, kb_id: str, row: dict, code: str) -> str:
+    """Point a mapping at another live problem of this knowledge base."""
+    from sqlalchemy import text
+    from app.l45_ml_platform.compiler.sop_extractor import live_taxonomy
+
+    code = code.strip().upper()
+    node = live_taxonomy(conn, kb_id).get(code)
+    if node is None:
+        raise LifecycleError(400, f"{code} is not in this knowledge base's live issue taxonomy")
+    if conn.execute(text("""
+        SELECT 1 FROM kirana_kart.draft_taxonomy_proposals
+        WHERE kb_id = :kb AND entity_id = :eid AND issue_code = :code AND id <> :id
+    """), {"kb": kb_id, "eid": row["entity_id"], "code": code, "id": row["id"]}).scalar():
+        raise LifecycleError(409, f"{code} is already mapped in this proposal")
+    conn.execute(text("""
+        UPDATE kirana_kart.draft_taxonomy_proposals
+        SET issue_code = :code, label = :label, description = :desc,
+            parent_code = :parent, level = :level
+        WHERE id = :id
+    """), {"code": code, "label": node["label"], "desc": node.get("description"),
+           "parent": node.get("parent_code"), "level": node["level"], "id": row["id"]})
+    return code
 
 
 @router.put("/kb/{kb_id}/taxonomy-proposals/{proposal_id}")
@@ -1075,7 +1125,8 @@ def list_action_proposals(
             SELECT id, action_code_id, action_name, action_description, exact_action,
                    parent_issue_codes, requires_refund, requires_escalation,
                    automation_eligible, proposal_type, status,
-                   extraction_confidence, edit_reason, llm_output, user_output, edited_at
+                   extraction_confidence, edit_reason, llm_output, user_output, edited_at,
+                   edited_by, source_excerpt
             FROM kirana_kart.draft_action_proposals
             WHERE kb_id = :kb_id AND entity_id = :eid
             ORDER BY action_code_id

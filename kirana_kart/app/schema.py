@@ -2,7 +2,7 @@
 from sqlalchemy import text
 from app.admin.db import engine
 
-SCHEMA_REVISION = '0009_rule_decisions'
+SCHEMA_REVISION = '0010_policy_knowledge'
 
 
 def verify_schema():

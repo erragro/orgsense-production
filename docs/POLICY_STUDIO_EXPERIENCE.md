@@ -242,3 +242,108 @@ Before switching to enforce:
   evaluated. Watch the panel for at least a representative period, and review
   every rule that differs from the AI often.
 - **Unused flag:** `overrideable` is still not interpreted by the runtime.
+
+## Closed taxonomy, SOP knowledge and retained edits — 26 September 2026
+
+Three gaps made the pipeline open-ended. Stage 0 classified tickets into
+whatever labels the model returned: the candidates came from a vector corpus
+hard-coded to `v1`, and nothing checked the answer. Policy Studio could create
+new issue codes from any SOP. The only record of reviewers' corrections fed the
+next extraction after a publish, with the fixed reason "User correction".
+
+Now implemented (migration 0010):
+
+- **Map-only taxonomy.** Stage 1 of the extraction maps the SOP onto the
+  knowledge base's live issue taxonomy and cannot create codes.
+  - **Gaps:** a problem the taxonomy lacks becomes a *gap*
+    (`policy_taxonomy_gaps`) with the quoted SOP text and a suggested code for a
+    taxonomy admin. A reviewer maps it to a live code — usually one the admin
+    has just added — or dismisses it, with a reason.
+  - **Reviewer control:** a mapping can only be re-pointed at another live
+    code. Names and descriptions belong to the taxonomy.
+  - **Checks:** rule generation and submission refuse any code that is not live
+    for the knowledge base, and publishing never writes to `issue_taxonomy`.
+- **Stage 0 is closed.** The model is shown the live policy's taxonomy and must
+  answer with one of its codes; the answer is checked (`policy_knowledge.resolve_issue`).
+  - **Output shape:** `issue_type_l1` is the level-1 root and `issue_type_l2`
+    is the node, matching how rules are written.
+  - **Unrecognised answers:** these become `UNCLASSIFIED` with confidence at
+    most 0.3. Stage 2 then sends the ticket to a person (`issue_not_in_taxonomy`)
+    instead of auto-resolving it.
+  - **No taxonomy:** without a live policy or taxonomy, the earlier open
+    classification runs, reported as `taxonomy_status: unavailable`.
+- **Any SOP, in full.** Long documents are read in up to eight windows of
+  12,000 characters, cut at headings or paragraphs, and the results merged.
+  Only text beyond 96,000 characters is reported as not analysed. The nginx and
+  client timeouts allow 10 minutes for this.
+- **Editable knowledge passages** (`policy_knowledge_chunks`, versioned with the
+  proposal):
+  - **Content:** each passage has a title, text, the problems it applies to, a
+    purpose (decision, reply or both) and the SOP quote it came from, located in
+    the document where possible.
+  - **Review:** reviewers accept, edit, remove or add passages. The AI's
+    original is kept.
+  - **Change control:** accepted passages are part of the approved fingerprint,
+    so changing one after submission invalidates the approval.
+- **Variables.** Passages embed `{{name}}`:
+  - **Tenant values:** set per knowledge base, optionally per business line
+    (`policy_variables`). Examples are `business_name`, `support_tone`,
+    `support_hours`, `escalation_contact` and `refund_cap_default`.
+  - **Ticket values:** filled per ticket — `customer_tier`, `order_id`,
+    `order_value`, `order_history_summary`, `issue_label`, plus `refund_amount`
+    and `resolution_summary` in replies.
+  - **Suggestions:** the extraction suggests values it finds in the SOP but
+    sets none.
+  - **Submission check:** submission is refused while a passage uses a tenant
+    variable with no value. A value that is missing at runtime shows as
+    `[name not set]`, never a blank.
+- **Runtime use.** Stage 1 is given the rendered decision passages for the
+  ticket's problem — specific problem first, then its category, then general
+  passages; at most 6 passages and 4,000 characters. Stage 3's reply draft for
+  human review includes the rendered reply passages and signs off with
+  `business_name`. Both record which passages they used.
+- **Business line = use case.** The wizard asks which business line an SOP is
+  for. Generated rules and passages carry it, the worker matches it
+  case-insensitively, and it scopes the lessons below.
+- **What changed versus what the AI generated.**
+  - **Proposals:** every AI proposal (mapping, gap, action, passage, generated
+    rule) is logged as `proposed`; unreviewed output is no longer logged as
+    accepted. Nothing is auto-accepted: a person accepts, including in bulk
+    ("Accept confident matches ≥ 75%").
+  - **Corrections:** every edit, removal and addition — rule priority, amounts
+    and conditions in the rule editors included — records a field-level diff
+    (`field_changes`: AI value → reviewer value), the business line and the
+    reviewer's own reason, which is required.
+- **Learning is continuous.** Every extraction prompt carries the latest
+  corrections for the knowledge base: this business line's first, then the
+  rest of the knowledge base's as shared lessons (`lessons_for`). They apply
+  from the next analysis, with no publish needed. The wizard shows the same
+  list ("What the AI has learned from reviewers").
+
+Validation:
+
+- **Unit tests:** 40 new tests cover issue resolution, Stage 0, 2 and 3
+  behaviour, passage selection, rendering, runtime loading and caching, and
+  lesson text.
+- **PostgreSQL integration test, over HTTP:**
+  - mapping and gap resolution;
+  - passages with located quotes, edits with reasons and diffs;
+  - variables blocking submission, approval to live, and the taxonomy
+    unchanged;
+  - Stage 0 closed on the live policy, Stage 1 and 3 rendering;
+  - the v1 corrections appearing in v2's extraction prompts.
+- **Browser tests:** they cover the business line, lessons, gap mapping,
+  required reasons, passage review and variable entry.
+
+Known limits:
+
+- **Taxonomy admin work:** adding a code is still done through the taxonomy
+  lifecycle. Policy Studio lists the gaps (`GET /bpm/kb/{kb}/taxonomy-gaps?status=open`)
+  but does not create codes.
+- **Unlabelled replay samples:** the sample replay does not filter by business
+  line. Samples without one never match line-scoped rules, and are counted as
+  unchanged.
+- **Variable changes are not approved:** they reach live replies within the
+  60-second runtime cache and are logged, but are not approved like passages.
+- **Analysis runs in the request:** it is a long synchronous request. A
+  background job would be sturdier for very long documents.

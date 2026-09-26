@@ -1,13 +1,18 @@
 /**
- * VersionWizard — 7-step guided flow for creating a new policy version.
+ * VersionWizard — 8-step guided flow for creating a new policy version.
  *
- * Step 1 — Upload Document
- * Step 2 — AI Analysis (extract taxonomy from SOP)
- * Step 3 — Taxonomy Review (accept / edit / reject each issue node)
+ * Step 1 — Upload Document (with the business line it is written for)
+ * Step 2 — AI Analysis (map the SOP onto the live issue taxonomy)
+ * Step 3 — Problem Review (accept / re-map / reject each mapping; resolve gaps)
  * Step 4 — Action Review (accept / edit / reject each extracted action)
  * Step 5 — Rules Review (deterministically generated rules, inline editing)
- * Step 6 — Preview (sample decision comparison — the server records it as a gate)
- * Step 7 — Request approval (another policy administrator approves and activates)
+ * Step 6 — Knowledge (SOP passages and the variables they embed)
+ * Step 7 — Preview (sample decision comparison — the server records it as a gate)
+ * Step 8 — Request approval (another policy administrator approves and activates)
+ *
+ * Every correction carries the reviewer's reason: it is recorded against what
+ * the AI produced and given to the next extraction for this knowledge base
+ * and business line.
  *
  * The server advances the proposal's stage as each step's work completes, so
  * a proposal can be closed and resumed (resumeEntityId) at any point.
@@ -34,7 +39,12 @@ import {
   type ReviewProposalPayload,
   type SimulationGateResult,
   type SkippedPairing,
+  type LiveIssue,
 } from '@/api/governance/bpm.api'
+import {
+  BusinessLineField, KnowledgeStep, LessonsPanel, MIN_REASON, ReasonAction, ReasonField,
+  SourceQuote, TaxonomyGapsPanel,
+} from './PolicyKnowledge'
 
 interface Props {
   kbId: string
@@ -44,13 +54,13 @@ interface Props {
   onCreated: () => void
 }
 
-type Step = 1 | 2 | 3 | 4 | 5 | 6 | 7
+type Step = 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8
 
 // ============================================================
 // API helpers
 // ============================================================
 
-interface BusinessBrief { name: string; outcome: string; scope: string }
+interface BusinessBrief { name: string; outcome: string; scope: string; businessLine: string }
 
 const uploadDocument = (kbId: string, file: File, brief: BusinessBrief) => {
   const form = new FormData()
@@ -58,7 +68,8 @@ const uploadDocument = (kbId: string, file: File, brief: BusinessBrief) => {
   form.append('change_name', brief.name)
   form.append('business_outcome', brief.outcome)
   form.append('affected_scope', brief.scope)
-  return apiClient.post<{ upload_id: string; filename: string; entity_id: string; bpm_instance_id: number }>(
+  form.append('business_line', brief.businessLine)
+  return apiClient.post<{ upload_id: string; filename: string; entity_id: string; bpm_instance_id: number; business_line: string | null }>(
     `/bpm/kb/${kbId}/upload`, form,
     { headers: { 'Content-Type': 'multipart/form-data' } },
   )
@@ -90,7 +101,7 @@ type RulePayload = { refund_amount?: number; refund_percent?: number; max_refund
 
 const PHASES = ['Define change', 'Review decisions', 'Test impact', 'Launch decision']
 function StepIndicator({ current }: { current: Step }) {
-  const phase = current === 1 ? 0 : current <= 5 ? 1 : current === 6 ? 2 : 3
+  const phase = current === 1 ? 0 : current <= 6 ? 1 : current === 7 ? 2 : 3
   return <ol aria-label="Policy change journey" className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-6">
     {PHASES.map((label, index) => <li key={label} aria-current={index === phase ? 'step' : undefined}
       className={cn('rounded-lg border px-3 py-2 text-xs', index === phase ? 'border-brand-500 bg-brand-50 text-brand-700 dark:bg-brand-500/10 dark:text-brand-400' : 'border-surface-border text-foreground/70')}>
@@ -118,7 +129,7 @@ function UploadStep({
   kbId: string
   onNext: (entityId: string, filename: string) => void
 }) {
-  const [brief, setBrief] = useState<BusinessBrief>({ name: '', outcome: '', scope: '' })
+  const [brief, setBrief] = useState<BusinessBrief>({ name: '', outcome: '', scope: '', businessLine: 'ecommerce' })
   const [dragOver, setDragOver] = useState(false)
   const [file, setFile] = useState<File | null>(null)
   const [error, setError] = useState('')
@@ -155,6 +166,7 @@ function UploadStep({
         <label className="block text-sm font-medium">Who or what should this affect? <span className="text-foreground/70 font-normal">(optional)</span>
           <input className={inp + ' mt-1'} maxLength={1000} value={brief.scope} onChange={e => setBrief({ ...brief, scope: e.target.value })} placeholder="e.g. Missing-item complaints in grocery delivery" />
         </label>
+        <BusinessLineField kbId={kbId} value={brief.businessLine} onChange={businessLine => setBrief({ ...brief, businessLine })} />
         <p className="text-xs text-foreground/70">Your brief is saved with the uploaded proposal. Scope describes your intent; confirm the generated conditions actually enforce it.</p>
       </div>
       <div
@@ -249,6 +261,11 @@ function AIAnalysisStep({
   const [findings, setFindings] = useState<string[]>([])
   const [error, setError] = useState('')
   const [truncation, setTruncation] = useState('')
+  const readiness = useQuery({
+    queryKey: ['bpm', 'readiness', kbId, entityId],
+    queryFn: () => bpmApi.getReadiness(kbId, entityId).then(r => r.data),
+  })
+  const businessLine = readiness.data?.business_line ?? null
 
   const extractMut = useMutation({
     mutationFn: () => bpmApi.extractTaxonomy(kbId, entityId),
@@ -256,15 +273,13 @@ function AIAnalysisStep({
     onSuccess: (res) => {
       setStatus('done')
       const proposals: TaxonomyProposal[] = res.data.proposals ?? []
+      const gaps = res.data.gaps ?? []
       setTruncation(res.data.truncated
         ? `Only the first ${res.data.analysed_characters.toLocaleString()} of ${res.data.document_characters.toLocaleString()} characters were analysed. Check that the rest of your SOP is covered, or split it into separate proposals.`
         : '')
-      const newCount = proposals.filter((p) => p.proposal_type === 'new').length
-      const existingCount = proposals.filter((p) => p.proposal_type === 'existing').length
       setFindings([
-        `${proposals.length} issue categories identified`,
-        newCount > 0 ? `${newCount} new categories to review` : 'All categories already in registry',
-        existingCount > 0 ? `${existingCount} matched to existing taxonomy` : '',
+        `${proposals.length} customer problem${proposals.length === 1 ? '' : 's'} matched to your issue taxonomy`,
+        gaps.length > 0 ? `${gaps.length} problem${gaps.length === 1 ? '' : 's'} your taxonomy has no code for — listed for review` : '',
         'Ready for your review',
       ].filter(Boolean))
     },
@@ -278,7 +293,7 @@ function AIAnalysisStep({
       <div>
         <h2 className="text-lg font-semibold text-foreground">Understand your SOP</h2>
         <p className="text-sm text-foreground/70 mt-1">
-          We are identifying customer problems in your SOP and matching them to your existing categories. You remain in control of the interpretation.
+          We are matching the customer problems in your SOP to your issue taxonomy. Problems it has no code for are listed, not invented. You remain in control of the interpretation.
         </p>
       </div>
 
@@ -324,6 +339,8 @@ function AIAnalysisStep({
           </div>
         )}
       </div>
+
+      <LessonsPanel kbId={kbId} businessLine={businessLine} />
 
       <div className="flex justify-between">
         <button
@@ -375,39 +392,41 @@ function statusBadge(status: ProposalStatus) {
 function typeBadge(type: string) {
   if (type === 'new') return <span className="text-xs px-1.5 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-600">New</span>
   if (type === 'update') return <span className="text-xs px-1.5 py-0.5 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-500">Update</span>
-  return <span className="text-xs px-1.5 py-0.5 rounded-full bg-surface text-foreground/70 border border-surface-border">Existing</span>
+  return <span className="text-xs px-1.5 py-0.5 rounded-full bg-surface text-foreground/70 border border-surface-border">In your taxonomy</span>
 }
 
 function TaxonomyProposalRow({
   proposal,
   kbId,
+  issues,
   onUpdated,
 }: {
   proposal: TaxonomyProposal
   kbId: string
+  issues: LiveIssue[]
   onUpdated: () => void
 }) {
   const [editing, setEditing] = useState(false)
-  const [label, setLabel] = useState(proposal.label)
-  const [description, setDescription] = useState(proposal.description ?? '')
+  const [code, setCode] = useState(proposal.issue_code)
+  const [reason, setReason] = useState('')
 
   const reviewMut = useMutation({
     mutationFn: (payload: ReviewProposalPayload) =>
       bpmApi.reviewTaxonomyProposal(kbId, proposal.id, payload),
-    onSuccess: () => { setEditing(false); onUpdated() },
+    onSuccess: () => { setEditing(false); setReason(''); onUpdated() },
   })
   const reviewError = reviewMut.isError ? apiErrorMessage(reviewMut.error, 'Could not save this review.') : ''
 
-
   const accept = () => reviewMut.mutate({ status: 'accepted' })
-  const reject = () => reviewMut.mutate({ status: 'rejected' })
+  const reject = (why: string) => reviewMut.mutate({ status: 'rejected', edit_reason: why })
+  // Problems belong to the taxonomy; a reviewer can only point the mapping
+  // at a different live problem.
   const saveEdit = () => reviewMut.mutate({
     status: 'edited',
-    edit_reason: 'User correction',
-    user_output: { label, description },
+    edit_reason: reason.trim(),
+    user_output: { issue_code: code },
   })
-
-  const indent = proposal.level * 20
+  const accepted = proposal.status === 'accepted' || proposal.status === 'edited'
 
   return (
     <div
@@ -415,27 +434,26 @@ function TaxonomyProposalRow({
         'border rounded-xl p-3 transition-colors',
         proposal.status === 'rejected'
           ? 'border-surface-border bg-surface opacity-60'
-          : proposal.status === 'accepted' || proposal.status === 'edited'
+          : accepted
             ? 'border-green-200 dark:border-green-700/50 bg-green-50/40 dark:bg-green-900/10'
             : 'border-surface-border bg-surface-card',
       )}
-      style={{ marginLeft: indent }}
+      style={{ marginLeft: (proposal.level - 1) * 20 }}
     >
       {editing ? (
         <div className="space-y-2">
-          <div>
-            <label className="text-xs text-foreground/70 mb-0.5 block">Label</label>
-            <input className={inp} value={label} onChange={e => setLabel(e.target.value)} />
-          </div>
-          <div>
-            <label className="text-xs text-foreground/70 mb-0.5 block">Description</label>
-            <input className={inp} value={description} onChange={e => setDescription(e.target.value)} placeholder="Optional description" />
-          </div>
+          <label className="block text-xs text-foreground/70">This part of the SOP is about
+            <select className={inp + ' mt-0.5'} value={code} onChange={e => setCode(e.target.value)}>
+              {issues.map(i => <option key={i.issue_code} value={i.issue_code}>{i.label} ({i.issue_code})</option>)}
+            </select>
+          </label>
+          <ReasonField value={reason} onChange={setReason} />
+          {reviewError && <p role="alert" className="text-xs text-red-600">{reviewError}</p>}
           <div className="flex gap-2 justify-end">
             <button onClick={() => setEditing(false)} className="px-3 py-1 text-xs border border-surface-border rounded-lg text-foreground hover:bg-surface">Cancel</button>
             <button
               onClick={saveEdit}
-              disabled={reviewMut.isPending || !label}
+              disabled={reviewMut.isPending || code === proposal.issue_code || reason.trim().length < MIN_REASON}
               className="flex items-center gap-1 px-3 py-1 text-xs bg-brand-600 text-white rounded-lg hover:bg-brand-700 disabled:opacity-40"
             >
               <Save className="w-3 h-3" /> {reviewMut.isPending ? 'Saving…' : 'Save'}
@@ -443,9 +461,9 @@ function TaxonomyProposalRow({
           </div>
         </div>
       ) : (
-        <div className="flex items-center gap-2">
-          {proposal.level > 0 && <ChevronRight className="w-3 h-3 text-foreground/70 shrink-0" />}
-          <Tag className="w-3.5 h-3.5 text-foreground/70 shrink-0" />
+        <div className="flex items-start gap-2">
+          {proposal.level > 1 && <ChevronRight className="w-3 h-3 text-foreground/70 shrink-0 mt-1" />}
+          <Tag className="w-3.5 h-3.5 text-foreground/70 shrink-0 mt-1" />
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-1.5 flex-wrap">
               <span className="text-sm font-medium text-foreground">{proposal.label}</span>
@@ -454,50 +472,36 @@ function TaxonomyProposalRow({
               {statusBadge(proposal.status)}
               {proposal.extraction_confidence != null && (
                 <span className="text-xs text-foreground/70">
-                  AI interpretation: {Math.round(proposal.extraction_confidence * 100)}% confidence — verify against your SOP
+                  AI match: {Math.round(proposal.extraction_confidence * 100)}% confidence — verify against your SOP
                 </span>
               )}
             </div>
             {proposal.description && (
               <p className="text-xs text-foreground/70 mt-0.5 truncate">{proposal.description}</p>
             )}
+            <SourceQuote excerpt={proposal.source_excerpt} />
+            {proposal.edit_reason && <p className="text-xs text-foreground/70 mt-0.5">Reviewer: {proposal.edit_reason}</p>}
             {reviewError && <p role="alert" className="text-xs text-red-600 mt-1">{reviewError}</p>}
           </div>
           <div className="flex items-center gap-1 shrink-0">
-            {proposal.status !== 'rejected' && proposal.status !== 'accepted' && proposal.status !== 'edited' && (
+            {!accepted && (
               <button
                 onClick={accept}
                 disabled={reviewMut.isPending}
                 className="p-1.5 rounded-lg text-foreground/70 hover:text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20 transition-colors"
-                title="Accept"
+                title={proposal.status === 'rejected' ? 'Restore' : 'Accept'}
               >
                 <Check className="w-3.5 h-3.5" />
               </button>
             )}
-            {(proposal.status === 'accepted' || proposal.status === 'edited') && (
-              <button
-                onClick={reject}
-                disabled={reviewMut.isPending}
-                className="p-1.5 rounded-lg text-foreground/70 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors"
-                title="Reject"
-              >
-                <XCircle className="w-3.5 h-3.5" />
-              </button>
-            )}
-            {proposal.status === 'rejected' && (
-              <button
-                onClick={accept}
-                disabled={reviewMut.isPending}
-                className="p-1.5 rounded-lg text-foreground/70 hover:text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20 transition-colors"
-                title="Restore"
-              >
-                <Check className="w-3.5 h-3.5" />
-              </button>
+            {proposal.status !== 'rejected' && (
+              <ReasonAction label="Reject" title="Reject" icon={<XCircle className="w-3.5 h-3.5" />}
+                pending={reviewMut.isPending} onConfirm={reject} />
             )}
             <button
               onClick={() => setEditing(true)}
               className="p-1.5 rounded-lg text-foreground/70 hover:text-brand-500 hover:bg-surface transition-colors"
-              title="Edit"
+              title="Map to a different problem"
             >
               <Pencil className="w-3.5 h-3.5" />
             </button>
@@ -527,18 +531,15 @@ function TaxonomyReviewStep({
   })
 
   const refresh = () => qc.invalidateQueries({ queryKey: qKey })
+  const issues = useQuery({ queryKey: ['bpm', 'live-taxonomy', kbId], queryFn: () => bpmApi.getLiveTaxonomy(kbId).then(r => r.data) })
 
   const sorted = [...proposals].sort((a, b) => a.level - b.level || a.issue_code.localeCompare(b.issue_code))
   const accepted = proposals.filter((p: TaxonomyProposal) => p.status === 'accepted' || p.status === 'edited').length
   const pending = proposals.filter((p: TaxonomyProposal) => p.status === 'pending').length
 
+  // Nothing the AI matched is accepted until a person accepts it.
   const acceptAll = useMutation({
-    mutationFn: async () => {
-      const pendingProposals = (proposals as TaxonomyProposal[]).filter(p => p.status === 'pending')
-      for (const p of pendingProposals) {
-        await bpmApi.reviewTaxonomyProposal(kbId, p.id, { status: 'accepted' })
-      }
-    },
+    mutationFn: (minConfidence?: number) => bpmApi.acceptAll(kbId, entityId, 'taxonomy', minConfidence),
     onSuccess: refresh,
     onError: refresh,
   })
@@ -550,18 +551,27 @@ function TaxonomyReviewStep({
         <div>
           <h2 className="text-lg font-semibold text-foreground">Which customer problems does this cover?</h2>
           <p className="text-sm text-foreground/70 mt-1">
-            These customer problems were identified in your document. Keep the right ones, clarify their meaning, or exclude them.
-            Each accepted problem will link to a response and the conditions for using it.
+            Your SOP was matched to these problems in your issue taxonomy — the same list live tickets are classified into.
+            Keep the right matches, point a wrong one at the right problem, or exclude it. Each accepted problem will link to a response.
           </p>
         </div>
         {pending > 0 && (
-          <button
-            onClick={() => acceptAll.mutate()}
-            disabled={acceptAll.isPending}
-            className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 text-xs bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 border border-green-200 dark:border-green-700 rounded-lg hover:bg-green-100 dark:hover:bg-green-900/30 transition-colors disabled:opacity-40"
-          >
-            <Check className="w-3 h-3" /> Accept all ({pending})
-          </button>
+          <div className="shrink-0 flex flex-col gap-1.5">
+            <button
+              onClick={() => acceptAll.mutate(0.75)}
+              disabled={acceptAll.isPending}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs border border-surface-border rounded-lg hover:bg-surface transition-colors disabled:opacity-40"
+            >
+              <Check className="w-3 h-3" /> Accept confident matches (≥ 75%)
+            </button>
+            <button
+              onClick={() => acceptAll.mutate(undefined)}
+              disabled={acceptAll.isPending}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 border border-green-200 dark:border-green-700 rounded-lg hover:bg-green-100 dark:hover:bg-green-900/30 transition-colors disabled:opacity-40"
+            >
+              <Check className="w-3 h-3" /> Accept all ({pending})
+            </button>
+          </div>
         )}
       </div>
 
@@ -581,7 +591,7 @@ function TaxonomyReviewStep({
         </div>
       ) : sorted.length === 0 ? (
         <div className="text-center py-8 text-sm text-foreground/70">
-          No proposals found. Go back and run AI analysis first.
+          No problems in your taxonomy were matched. Go back and run the analysis, or resolve the problems listed below.
         </div>
       ) : (
         <div className="space-y-1.5 max-h-[400px] overflow-y-auto pr-1">
@@ -590,11 +600,14 @@ function TaxonomyReviewStep({
               key={p.id}
               proposal={p}
               kbId={kbId}
+              issues={issues.data ?? []}
               onUpdated={refresh}
             />
           ))}
         </div>
       )}
+
+      <TaxonomyGapsPanel kbId={kbId} entityId={entityId} onChanged={refresh} />
 
       <div className="flex justify-between pt-1">
         <button
@@ -641,11 +654,12 @@ function ActionProposalCard({
   const reviewError = reviewMut.isError ? apiErrorMessage(reviewMut.error, 'Could not save this review.') : ''
 
 
+  const [reason, setReason] = useState('')
   const accept = () => reviewMut.mutate({ status: 'accepted' })
-  const reject = () => reviewMut.mutate({ status: 'rejected' })
+  const reject = (why: string) => reviewMut.mutate({ status: 'rejected', edit_reason: why })
   const saveEdit = () => reviewMut.mutate({
     status: 'edited',
-    edit_reason: 'User correction',
+    edit_reason: reason.trim(),
     user_output: { action_name: actionName, exact_action: exactAction, action_description: description },
   })
 
@@ -683,11 +697,13 @@ function ActionProposalCard({
             <label className="text-xs text-foreground/70 mb-0.5 block">Description</label>
             <input className={inp} value={description} onChange={e => setDescription(e.target.value)} />
           </div>
+          <ReasonField value={reason} onChange={setReason} />
+          {reviewError && <p role="alert" className="text-xs text-red-600">{reviewError}</p>}
           <div className="flex gap-2 justify-end">
             <button onClick={() => setEditing(false)} className="px-3 py-1.5 text-xs border border-surface-border rounded-lg text-foreground hover:bg-surface">Cancel</button>
             <button
               onClick={saveEdit}
-              disabled={reviewMut.isPending || !actionName}
+              disabled={reviewMut.isPending || !actionName || reason.trim().length < MIN_REASON}
               className="flex items-center gap-1 px-3 py-1.5 text-xs bg-brand-600 text-white rounded-lg hover:bg-brand-700 disabled:opacity-40"
             >
               <Save className="w-3 h-3" /> {reviewMut.isPending ? 'Saving…' : 'Save'}
@@ -707,6 +723,8 @@ function ActionProposalCard({
             {action.exact_action && (
               <p className="text-xs text-foreground/70 mt-1">{action.exact_action}</p>
             )}
+            <SourceQuote excerpt={action.source_excerpt} />
+            {action.edit_reason && <p className="text-xs text-foreground/70 mt-0.5">Reviewer: {action.edit_reason}</p>}
             {action.parent_issue_codes.length > 0 && (
               <div className="flex items-center gap-1 flex-wrap mt-1">
                 <span className="text-xs text-foreground/70">Applies to:</span>
@@ -734,11 +752,9 @@ function ActionProposalCard({
                 <Check className="w-3.5 h-3.5" />
               </button>
             )}
-            {(action.status === 'accepted' || action.status === 'edited') && (
-              <button onClick={reject} disabled={reviewMut.isPending}
-                className="p-1.5 rounded-lg text-foreground/70 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors" title="Reject">
-                <XCircle className="w-3.5 h-3.5" />
-              </button>
+            {action.status !== 'rejected' && (
+              <ReasonAction label="Reject" title="Reject" icon={<XCircle className="w-3.5 h-3.5" />}
+                pending={reviewMut.isPending} onConfirm={reject} />
             )}
             {action.status === 'rejected' && (
               <button onClick={accept} disabled={reviewMut.isPending}
@@ -794,12 +810,7 @@ function ActionReviewStep({
   })
 
   const acceptAll = useMutation({
-    mutationFn: async () => {
-      const pendingActions = (actions as ActionProposal[]).filter(a => a.status === 'pending')
-      for (const a of pendingActions) {
-        await bpmApi.reviewActionProposal(kbId, a.id, { status: 'accepted' })
-      }
-    },
+    mutationFn: () => bpmApi.acceptAll(kbId, entityId, 'actions'),
     onSuccess: refresh,
     onError: refresh,
   })
@@ -1087,13 +1098,14 @@ function RuleCard({
     ...draftAmounts(rule.action_payload),
   })
 
+  const [reason, setReason] = useState('')
   const saveMut = useMutation({
-    mutationFn: () => apiClient.put(`/rules/${kbId}/${rule.id}`, toPayload(draft)),
-    onSuccess: () => { setEditing(false); onSaved() },
+    mutationFn: () => apiClient.put(`/rules/${kbId}/${rule.id}`, { ...toPayload(draft), edit_reason: reason.trim() }),
+    onSuccess: () => { setEditing(false); setReason(''); onSaved() },
   })
 
   const delMut = useMutation({
-    mutationFn: () => apiClient.delete(`/rules/${kbId}/${rule.id}`),
+    mutationFn: (why: string) => apiClient.delete(`/rules/${kbId}/${rule.id}`, { params: { reason: why } }),
     onSuccess: onDeleted,
   })
   const error = saveMut.isError ? apiErrorMessage(saveMut.error, 'Could not save. Please check the fields and try again.')
@@ -1103,6 +1115,7 @@ function RuleCard({
     return (
       <div className="bg-surface-card border border-brand-500/40 rounded-xl p-4 space-y-3">
         <RuleFields kbId={kbId} draft={draft} setDraft={setDraft} />
+        <ReasonField value={reason} onChange={setReason} />
         {error && <p role="alert" className="text-xs text-red-500">{error}</p>}
         <div className="flex gap-2 justify-end">
           <button onClick={() => setEditing(false)}
@@ -1111,7 +1124,7 @@ function RuleCard({
           </button>
           <button
             onClick={() => saveMut.mutate()}
-            disabled={saveMut.isPending || !draft.issue_type_l1.trim() || !draft.action_id}
+            disabled={saveMut.isPending || !draft.issue_type_l1.trim() || !draft.action_id || reason.trim().length < MIN_REASON}
             className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-brand-600 text-white rounded-lg hover:bg-brand-700 disabled:opacity-40 transition-colors">
             <Save className="w-3.5 h-3.5" />
             {saveMut.isPending ? 'Saving…' : 'Save Rule'}
@@ -1156,13 +1169,8 @@ function RuleCard({
             className="p-1.5 rounded-lg text-foreground/70 hover:text-brand-500 hover:bg-surface transition-colors" title="Edit rule">
             <Pencil className="w-3.5 h-3.5" />
           </button>
-          <button
-            onClick={() => delMut.mutate()}
-            disabled={delMut.isPending}
-            className="p-1.5 rounded-lg text-foreground/70 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors disabled:opacity-40"
-            title="Remove rule">
-            <Trash2 className="w-3.5 h-3.5" />
-          </button>
+          <ReasonAction label="Remove" title="Remove rule" icon={<Trash2 className="w-3.5 h-3.5" />}
+            pending={delMut.isPending} onConfirm={why => delMut.mutate(why)} />
         </div>
       </div>
     </div>
@@ -1343,7 +1351,7 @@ function ReviewRulesStep({
           disabled={generateMut.isPending || rules.length === 0}
           className="flex items-center gap-2 px-5 py-2.5 bg-brand-600 text-white rounded-lg text-sm font-medium hover:bg-brand-700 disabled:opacity-40 transition-colors"
         >
-          Compare sample decisions <ArrowRight className="w-4 h-4" />
+          Review SOP knowledge <ArrowRight className="w-4 h-4" />
         </button>
       </div>
     </div>
@@ -1351,7 +1359,7 @@ function ReviewRulesStep({
 }
 
 // ============================================================
-// Step 6 — Preview (sample decision comparison)
+// Step 7 — Preview (sample decision comparison)
 // ============================================================
 
 type SimStatus = 'idle' | 'running' | 'passed' | 'failed' | 'not_applicable' | 'unavailable' | 'error'
@@ -1546,7 +1554,7 @@ function PreviewStep({
 }
 
 // ============================================================
-// Step 7 — Request approval
+// Step 8 — Request approval
 // ============================================================
 
 const MIN_JUSTIFICATION = 20
@@ -1565,12 +1573,14 @@ function SubmitStep({ kbId, entityId, evidence, onCreated, onBack }: {
   const brief = instance?.metadata?.business_brief as Partial<BusinessBrief> | undefined
   const review = readiness.data?.review
   const stage = readiness.data?.stage ?? instance?.current_stage
-  const pending = review ? review.taxonomy_pending + review.actions_pending : 0
+  const pending = review ? review.taxonomy_pending + review.actions_pending + (review.knowledge_pending ?? 0) : 0
+  const undefinedVariables = readiness.data?.undefined_variables ?? []
   const loaded = rules.isSuccess && instances.isSuccess && readiness.isSuccess
   const needsJustification = stage === 'SIMULATION_FAILED'
   const submitted = stage === 'PENDING_APPROVAL'
   const blockers = !loaded ? ['Review evidence could not be loaded yet. Try again before deciding.'] : [
     ...(pending > 0 ? [`Resolve the ${pending} items still awaiting your review.`] : []),
+    ...(undefinedVariables.length ? [`Set a value for ${undefinedVariables.map(v => `{{${v}}}`).join(', ')} (Knowledge step).`] : []),
     ...(!review?.rules ? ['Add and review at least one decision.'] : []),
     ...(!submitted && stage !== 'SHADOW_GATE' && stage !== 'SIMULATION_FAILED'
       ? ['Run the sample decision comparison (previous step) before requesting approval.'] : []),
@@ -1599,11 +1609,12 @@ function SubmitStep({ kbId, entityId, evidence, onCreated, onBack }: {
     <div><p className="text-xs uppercase tracking-widest text-brand-600 mb-2">Business review</p><h2 className="text-xl font-semibold">Request a launch decision</h2><p className="text-sm text-foreground/70 mt-2">Review the proposal, the evidence and the gaps, then ask another policy administrator to approve it. Nothing changes for customers until they approve.</p></div>
     <section className="rounded-xl border border-surface-border p-5 space-y-3">
       <h3 className="font-semibold">{brief?.name || 'Proposed policy change'}</h3>
-      <dl className="space-y-3 text-sm"><div><dt className="text-foreground/70">Intended business outcome</dt><dd>{brief?.outcome || 'No outcome was supplied with this version.'}</dd></div><div><dt className="text-foreground/70">Intended scope</dt><dd>{brief?.scope || 'Confirm which customers and situations the decision conditions cover.'}</dd></div><div><dt className="text-foreground/70">Proposal owner</dt><dd>{instance?.created_by_name || 'Not available'}</dd></div></dl>
+      <dl className="space-y-3 text-sm"><div><dt className="text-foreground/70">Intended business outcome</dt><dd>{brief?.outcome || 'No outcome was supplied with this version.'}</dd></div><div><dt className="text-foreground/70">Intended scope</dt><dd>{brief?.scope || 'Confirm which customers and situations the decision conditions cover.'}</dd></div><div><dt className="text-foreground/70">Business line</dt><dd>{readiness.data?.business_line || 'Every business line'}</dd></div><div><dt className="text-foreground/70">Proposal owner</dt><dd>{instance?.created_by_name || 'Not available'}</dd></div></dl>
     </section>
     <section className="rounded-xl border border-surface-border p-5 space-y-3 text-sm">
       <h3 className="font-semibold">Evidence, not assumptions</h3>
-      <p>{loaded ? `${review?.rules ?? 0} proposed decision${review?.rules === 1 ? '' : 's'} · ${pending} review item${pending === 1 ? '' : 's'} still open` : 'Review evidence is loading or unavailable.'}</p>
+      <p>{loaded ? `${review?.rules ?? 0} proposed decision${review?.rules === 1 ? '' : 's'} · ${review?.knowledge_accepted ?? 0} SOP passage${review?.knowledge_accepted === 1 ? '' : 's'} · ${pending} review item${pending === 1 ? '' : 's'} still open` : 'Review evidence is loading or unavailable.'}</p>
+      {!!review?.gaps_open && <p className="text-amber-700 dark:text-amber-400">{review.gaps_open} problem{review.gaps_open === 1 ? '' : 's'} in the SOP have no code in your taxonomy, so no decision covers them yet.</p>}
       <p>{summary}</p>
       <p className="text-foreground/70">Live comparison has not been verified by this wizard. A workflow stage alone does not prove cases were evaluated.</p>
       <p className="text-foreground/70">Savings, refund cost and customer satisfaction are not measured by this sample test.</p>
@@ -1627,17 +1638,19 @@ function SubmitStep({ kbId, entityId, evidence, onCreated, onBack }: {
 
 /** Where a resumed proposal picks up, from what already exists for it. */
 async function resumeStep(kbId: string, entityId: string): Promise<{ step: Step; filename: string }> {
-  const [instances, taxonomy, actions, rules] = await Promise.all([
+  const [instances, taxonomy, actions, rules, knowledge] = await Promise.all([
     bpmApi.listInstances(kbId, { entity_id: entityId, limit: 1 }).then(r => r.data),
     bpmApi.listTaxonomyProposals(kbId, entityId).then(r => r.data),
     bpmApi.listActionProposals(kbId, entityId).then(r => r.data),
     fetchRules(kbId, entityId).then(r => r.data),
+    bpmApi.listKnowledge(kbId, entityId).then(r => r.data.chunks),
   ])
   const instance = instances[0]
   const brief = instance?.metadata?.business_brief as Partial<BusinessBrief> | undefined
   const filename = brief?.name || entityId
   const stage = instance?.current_stage
-  if (stage === 'PENDING_APPROVAL' || stage === 'SHADOW_GATE' || stage === 'SIMULATION_FAILED') return { step: 7, filename }
+  if (stage === 'PENDING_APPROVAL' || stage === 'SHADOW_GATE' || stage === 'SIMULATION_FAILED') return { step: 8, filename }
+  if (knowledge.length) return { step: 6, filename }
   if (rules.length) return { step: 5, filename }
   if (actions.length) return { step: 4, filename }
   if (taxonomy.length) return { step: 3, filename }
@@ -1743,21 +1756,29 @@ export function VersionWizard({ kbId, resumeEntityId, onClose, onCreated }: Prop
               />
             )}
             {!resuming && step === 6 && (
-              <PreviewStep
+              <KnowledgeStep
                 kbId={kbId}
                 entityId={entityId}
                 onNext={() => setStep(7)}
-                onBack={() => { setEvidence(null); setStep(5) }}
-                onResult={setEvidence}
+                onBack={() => setStep(5)}
               />
             )}
             {!resuming && step === 7 && (
+              <PreviewStep
+                kbId={kbId}
+                entityId={entityId}
+                onNext={() => setStep(8)}
+                onBack={() => { setEvidence(null); setStep(6) }}
+                onResult={setEvidence}
+              />
+            )}
+            {!resuming && step === 8 && (
               <SubmitStep
                 evidence={evidence}
                 kbId={kbId}
                 entityId={entityId}
                 onCreated={onCreated}
-                onBack={() => setStep(6)}
+                onBack={() => setStep(7)}
               />
             )}
           </div>

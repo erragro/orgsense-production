@@ -646,6 +646,7 @@ def _run_stage_0(
             _s0_span.set_attribute("stage.issue_type_l1", str(stage0.get("issue_type_l1", "")))
             _s0_span.set_attribute("stage.issue_type_l2", str(stage0.get("issue_type_l2", "")))
             _s0_span.set_attribute("stage.confidence",    str(stage0.get("confidence", "")))
+            _s0_span.set_attribute("stage.taxonomy_status", str(stage0.get("taxonomy_status", "")))
 
     result = {
         "llm_output_1_id": None,
@@ -655,6 +656,10 @@ def _run_stage_0(
         "image_required":  stage0.get("image_required", False),
         "reasoning":       stage0.get("reasoning", ""),
         "raw_response":    stage0.get("raw_response", "LLM"),
+        # 'mapped' / 'unmapped' against the live taxonomy, or 'unavailable'.
+        "taxonomy_status": stage0.get("taxonomy_status", "unavailable"),
+        "issue_label":     stage0.get("issue_label"),
+        "model_issue":     stage0.get("model_issue"),
     }
 
     # Write stub row to llm_output_1
@@ -1151,7 +1156,7 @@ def _fetch_rules(
                 FROM {SCHEMA}.rule_registry r
                 LEFT JOIN {SCHEMA}.master_action_codes m ON m.id = r.action_id
                 WHERE r.policy_version = %s
-                AND   (r.business_line = %s OR r.business_line IS NULL)
+                AND   (LOWER(r.business_line) = LOWER(%s) OR r.business_line IS NULL)
                 ORDER BY r.priority ASC, r.rule_id ASC
                 """,
                 (policy_version, business_line),
